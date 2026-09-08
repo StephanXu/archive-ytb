@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+state/
+.qa/
+node_modules/
+bin/
+dist/
+build/

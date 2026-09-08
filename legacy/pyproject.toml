@@ -1,0 +1,9 @@
+[project]
+name = "bilibili-season-sync"
+version = "0.1.0"
+description = "Authenticated Bilibili season diff and highest-quality staging downloader"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

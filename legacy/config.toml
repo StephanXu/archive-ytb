@@ -1,0 +1,21 @@
+[global]
+yt_dlp = 'C:\Users\xuzih\Documents\tools\yt-dlp\yt-dlp.exe'
+cookie_file = 'C:\Users\xuzih\Documents\tools\yt-dlp\ytbcookie.txt'
+ffprobe = 'ffprobe'
+
+[[tasks]]
+name = 'css'
+season_url = 'https://space.bilibili.com/265529806/lists/7913961?type=season'
+library_dir = 'C:\Users\xuzih\OneDrive\投研\技术学习\常士杉\常士杉直播脱水'
+download_dir = '~/Downloads'
+
+# 可选：只处理严格晚于该日期的视频。
+after_date = 2026-07-27
+
+# 可以继续追加任意多个 task：
+# [[tasks]]
+# name = '另一个合集'
+# season_url = 'https://space.bilibili.com/.../lists/...?type=season'
+# library_dir = 'D:\VideoLibrary\Example'
+# download_dir = 'D:\Staging\Example'
+# after_date = 2026-01-01

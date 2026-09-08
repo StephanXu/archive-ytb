@@ -1,0 +1,40 @@
+{
+  "name": "archive-flow",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node build/server/index.js",
+    "dev": "tsx watch server/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && tsc -p tsconfig.server.json && vite build",
+    "setup:downloader": "tsx scripts/setup-downloader.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "format": "prettier --write server shared web/src scripts tests/*.test.ts *.json vite.config.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "express": "5.2.1",
+    "lucide-react": "1.41.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "smol-toml": "1.8.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/express": "5.0.6",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@vitejs/plugin-react": "6.1.1",
+    "prettier": "3.9.6",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  }
+}
