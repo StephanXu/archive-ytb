@@ -134,6 +134,19 @@ test("config CRUD, unified download directory, cache-only diff, exclusions and s
       (
         await f.request(`configs/${c.id}`, "PUT", {
           ...body,
+          name: "课程（已改名）",
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await f.request(`configs/${c.id}/diff`)).data.snapshot_id,
+      "snapshot1",
+    );
+    assert.equal(
+      (
+        await f.request(`configs/${c.id}`, "PUT", {
+          ...body,
           download_dir: "~/Downloads/custom",
         })
       ).status,

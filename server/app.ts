@@ -1,9 +1,10 @@
+import { archiveFile, fileIdentity } from "./file-actions.ts";
 import express from "express";
 import { z } from "zod";
 import { timingSafeEqual, randomUUID } from "node:crypto";
-import { unlink, stat } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { spawn } from "node:child_process";
+import { unlink, stat, lstat, realpath } from "node:fs/promises";
+import { join, dirname, relative, isAbsolute } from "node:path";
+import { openLocalPath } from "./open-local.ts";
 import { writeFileSync, renameSync, unlinkSync, existsSync } from "node:fs";
 import {
   configSchema,
@@ -35,12 +36,14 @@ export function createApp({
   legacy,
   token = "",
   downloader,
+  openPath = openLocalPath,
 }: {
   root: string;
   stateDir: string;
   legacy?: string;
   token?: string;
   downloader?: Downloader;
+  openPath?: typeof openLocalPath;
 }) {
   const store = new Store(stateDir),
     engine = new Engine(store, downloader || new Downloader(root), legacy),
@@ -158,7 +161,6 @@ export function createApp({
         !old ||
         (
           [
-            "name",
             "season_url",
             "cookie_id",
             "library_dir",
@@ -231,11 +233,23 @@ export function createApp({
       total: items.length,
     });
   });
-  app.put("/api/configs/:id/excluded", (req, res) => {
+  app.put("/api/configs/:id/excluded", async (req, res) => {
     const body = z
         .object({ excluded: z.array(bvSchema).max(50000) })
         .parse(req.body),
       c = engine.config(req.params.id);
+    const added = body.excluded.filter((bv) => !c.excluded.includes(bv));
+    if (added.length) {
+      engine.idle();
+      for (const root of [
+        c.library_dir ? expandPath(c.library_dir) : "",
+        engine.downloadDir(c),
+      ].filter(Boolean)) {
+        const files = await scanMedia(root);
+        if (added.some((bv) => files.has(bv)))
+          throw new TaskError("CONFLICT", "请先删除本地文件，再排除该条目");
+      }
+    }
     c.excluded = [...new Set(body.excluded)];
     store.put("configs", c.id, c);
     res.json({ ok: true });
@@ -334,21 +348,258 @@ export function createApp({
     });
     res.json(body);
   });
+  const deletionChecks = new Map<
+    string,
+    {
+      config: string;
+      bv: string;
+      files: { path: string; identity: string }[];
+      expires: number;
+    }
+  >();
+  app.post("/api/configs/:id/delete-file", async (req, res) => {
+    const c = engine.config(req.params.id);
+    const body = z
+      .object({ bv: bvSchema, confirmation: z.string().optional() })
+      .parse(req.body);
+    engine.idle();
+    engine.fileOperation = true;
+    // Scan each distinct root once per request, including shared config roots.
+    const scans = new Map<string, Promise<Map<string, string[]>>>();
+    function scan(root: string) {
+      const key = expandPath(root);
+      let result = scans.get(key);
+      if (!result) {
+        result = scanMedia(key);
+        scans.set(key, result);
+      }
+      return result;
+    }
+    async function roots(cfg: BackupConfig) {
+      return await Promise.all([
+        cfg.library_dir
+          ? scan(cfg.library_dir)
+          : Promise.resolve(new Map<string, string[]>()),
+        scan(engine.downloadDir(cfg)),
+      ]);
+    }
+    try {
+      for (const [key, value] of deletionChecks)
+        if (value.expires < Date.now()) deletionChecks.delete(key);
+      const maps = await roots(c);
+      const paths = [
+        ...new Set(maps.flatMap((map) => map.get(body.bv) || [])),
+      ].sort();
+      if (!paths.length)
+        throw new TaskError("CONFLICT", "未找到本地文件，请刷新列表");
+      const files = await Promise.all(
+        paths.map(async (path) => ({
+          path,
+          identity: await fileIdentity(path),
+        })),
+      );
+      if (!body.confirmation) {
+        const confirmation = randomUUID();
+        deletionChecks.set(confirmation, {
+          config: c.id,
+          bv: body.bv,
+          files,
+          expires: Date.now() + 300000,
+        });
+        res.json({ confirmation, files: paths });
+        return;
+      }
+      const check = deletionChecks.get(body.confirmation);
+      deletionChecks.delete(body.confirmation);
+      if (
+        !check ||
+        check.config !== c.id ||
+        check.bv !== body.bv ||
+        JSON.stringify(check.files) !== JSON.stringify(files)
+      )
+        throw new TaskError(
+          "CONFLICT",
+          "文件已变化或确认已过期，请重新确认删除",
+        );
+      try {
+        for (const file of files) {
+          if ((await fileIdentity(file.path)) !== file.identity)
+            throw new TaskError("CONFLICT", "文件已变化，请重新确认删除");
+          await unlink(file.path);
+          for (const scanned of scans.values()) {
+            const map = await scanned;
+            const remaining = (map.get(body.bv) || []).filter(
+              (path) => path !== file.path,
+            );
+            if (remaining.length) map.set(body.bv, remaining);
+            else map.delete(body.bv);
+          }
+          store.db
+            .prepare("DELETE FROM media_files WHERE path=?")
+            .run(file.path);
+          for (const cfg of store.all<BackupConfig>("configs")) {
+            const key = cfg.id + ":" + body.bv;
+            if (
+              store.get<{ path: string }>("receipts", key)?.path === file.path
+            )
+              store.delete("receipts", key);
+          }
+        }
+      } finally {
+        for (const cfg of store.all<BackupConfig>("configs")) {
+          const snap = store.get<Snapshot>("snapshots", cfg.id);
+          if (!snap?.items.some((i) => i.bv === body.bv)) continue;
+          const [library, downloads] = await roots(cfg);
+          const archived = library.has(body.bv);
+          const staged = downloads.has(body.bv);
+          for (const item of snap.items)
+            if (item.bv === body.bv) {
+              item.base_status = archived
+                ? "archived"
+                : staged
+                  ? "staged"
+                  : item.base_status === "removed"
+                    ? "removed"
+                    : "missing";
+              item.verified = false;
+              delete item.quality_error;
+            }
+          snap.id = randomUUID();
+          store.put("snapshots", cfg.id, snap);
+        }
+      }
+      res.json({ ok: true });
+    } finally {
+      engine.fileOperation = false;
+    }
+  });
+  app.post("/api/configs/:id/archive", async (req, res) => {
+    const c = engine.config(req.params.id);
+    const body = z
+      .object({
+        bv: bvSchema,
+        confirmedHash: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .optional(),
+      })
+      .parse(req.body);
+    engine.idle();
+    if (!c.library_dir.trim())
+      throw new TaskError("VALIDATION", "请先在配置中设置存档目录");
+    engine.fileOperation = true;
+    try {
+      const result = await archiveFile(
+        engine.downloadDir(c),
+        expandPath(c.library_dir),
+        body.bv,
+        body.confirmedHash,
+      );
+      if (result.status !== "duplicate")
+        store.transaction(() => {
+          for (const snapshotConfig of store.all<BackupConfig>("configs")) {
+            const snap = store.get<Snapshot>("snapshots", snapshotConfig.id);
+            if (snap && snapshotConfig.id === c.id) {
+              snap.id = randomUUID();
+              for (const item of snap.items)
+                if (item.bv === body.bv) item.base_status = "archived";
+              store.put("snapshots", snapshotConfig.id, snap);
+            }
+          }
+          for (const receiptConfig of store.all<BackupConfig>("configs")) {
+            const key = receiptConfig.id + ":" + body.bv;
+            const receipt = store.get<{ path: string }>("receipts", key);
+            if (receipt?.path === result.source)
+              store.put("receipts", key, {
+                ...receipt,
+                path: result.destination,
+              });
+          }
+          store.db
+            .prepare(
+              "UPDATE OR REPLACE media_files SET path=?,metadata=json_set(metadata,'$.path',?) WHERE path=?",
+            )
+            .run(result.destination, result.destination, result.source);
+        });
+      res.json(result);
+    } finally {
+      engine.fileOperation = false;
+    }
+  });
+  async function resolveLocalFile(c: BackupConfig, bv: string) {
+    const receipt = store.get<{ path: string }>("receipts", c.id + ":" + bv);
+    const indexed = store.db
+      .prepare(
+        "SELECT f.path FROM media_files f JOIN media_sources s ON s.id=f.source_id WHERE s.platform='bilibili' AND s.external_id=?",
+      )
+      .all(bv) as { path: string }[];
+    const roots = [
+      c.library_dir ? expandPath(c.library_dir) : "",
+      engine.downloadDir(c),
+    ].filter(Boolean);
+    const status = store
+      .get<Snapshot>("snapshots", c.id)
+      ?.items.find((i) => i.bv === bv)?.base_status;
+    if (status === "staged") roots.reverse();
+    const candidates = [
+      ...new Set(
+        [receipt?.path, ...indexed.map((row) => row.path)].filter(
+          (path): path is string => !!path,
+        ),
+      ),
+    ];
+    // Verify recorded paths, rather than recursively enumerating both libraries on every click.
+    for (const root of roots) {
+      for (const path of candidates) {
+        const rel = relative(root, path);
+        if (
+          !rel ||
+          rel === ".." ||
+          rel.startsWith("..\\") ||
+          rel.startsWith("../") ||
+          isAbsolute(rel)
+        )
+          continue;
+        try {
+          if (!(await lstat(path)).isFile()) continue;
+          const physical = relative(await realpath(root), await realpath(path));
+          if (
+            physical &&
+            physical !== ".." &&
+            !physical.startsWith("..\\") &&
+            !physical.startsWith("../") &&
+            !isAbsolute(physical)
+          )
+            return path;
+        } catch {
+          /* An external move invalidates the saved path. */
+        }
+      }
+    }
+    for (const root of roots) {
+      const path = (await scanMedia(root)).get(bv)?.[0];
+      if (path) {
+        engine.library.recordFile("bilibili", bv, { path });
+        return path;
+      }
+    }
+    return undefined;
+  }
+  app.post("/api/configs/:id/open-file", async (req, res) => {
+    const c = engine.config(req.params.id);
+    const { bv } = z.object({ bv: bvSchema }).parse(req.body);
+    const path = await resolveLocalFile(c, bv);
+    if (!path) throw new TaskError("CONFLICT", "未找到本地视频，请刷新列表");
+    await openPath(path);
+    res.json({ ok: true, path });
+  });
   app.post("/api/configs/:id/open-folder", async (req, res) => {
     const config = engine.config(req.params.id);
     let path = engine.downloadDir(config);
     const body = z.object({ bv: bvSchema.optional() }).parse(req.body || {});
     if (body.bv) {
-      const roots = [
-        config.library_dir ? expandPath(config.library_dir) : "",
-        path,
-      ].filter(Boolean);
-      let file: string | undefined;
-      for (const root of roots) {
-        file = (await scanMedia(root)).get(body.bv)?.[0];
-        if (file) break;
-      }
-      if (!file) throw new TaskError("CONFLICT", "未找到本地视频，请刷新 diff");
+      const file = await resolveLocalFile(config, body.bv);
+      if (!file) throw new TaskError("CONFLICT", "未找到本地视频，请刷新列表");
       path = dirname(file);
     }
     if (!(await exists(path)) || (await stat(path)).isDirectory() === false)
@@ -356,24 +607,7 @@ export function createApp({
         "CONFLICT",
         "目录尚未创建，首次下载时会创建；现在可以复制路径",
       );
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(
-        process.platform === "win32"
-          ? "explorer.exe"
-          : process.platform === "darwin"
-            ? "open"
-            : "xdg-open",
-        [path],
-        { windowsHide: true, stdio: "ignore" },
-      );
-      child.once("error", () =>
-        reject(new TaskError("OPEN_FAILED", "无法打开文件管理器，请复制路径")),
-      );
-      child.once("spawn", () => {
-        child.unref();
-        resolve();
-      });
-    });
+    await openPath(path);
     res.json({ ok: true, path });
   });
   app.use("/api", (_req, res) =>

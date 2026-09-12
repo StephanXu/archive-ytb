@@ -135,14 +135,16 @@ export class Engine {
       (i) => ({
         ...i,
         cover_id: this.library.coverId("bilibili", i.bv),
-        status: excluded.has(i.bv)
-          ? "excluded"
-          : i.base_status === "missing" &&
-              c.after_date &&
-              i.date &&
-              i.date <= c.after_date
-            ? "filtered"
-            : i.base_status,
+        status: ["archived", "staged"].includes(i.base_status)
+          ? i.base_status
+          : excluded.has(i.bv)
+            ? "excluded"
+            : i.base_status === "missing" &&
+                c.after_date &&
+                i.date &&
+                i.date <= c.after_date
+              ? "filtered"
+              : i.base_status,
       }),
     );
   }
@@ -167,7 +169,9 @@ export class Engine {
       counts: this.counts(this.diff(c)),
     }));
   }
+  fileOperation = false;
   busy(id?: string) {
+    if (this.fileOperation) return true;
     return this.store
       .all<Job>("jobs")
       .some((j) => isActive(j) && (!id || j.config_id === id));
@@ -181,6 +185,8 @@ export class Engine {
     this.store.put("jobs", id, { ...j, ...fields, updated_at: now() });
   }
   enqueue(kind: Job["kind"], config_id?: string, extras: Partial<Job> = {}) {
+    if (this.fileOperation)
+      throw new TaskError("BUSY", "文件存档中，请稍后再试");
     if (this.stopped) throw new TaskError("STOPPING", "服务正在关闭");
     if (config_id) this.idle(config_id);
     if (

@@ -1692,14 +1692,66 @@ th {
   opacity: 1;
 }
 .row-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, 34px);
   align-items: center;
-  gap: 3px;
+  gap: 6px;
+  width: 74px;
+}
+.file-action-menu {
+  position: fixed;
+  z-index: 100;
+  display: grid;
+  gap: 2px;
+  width: 224px;
+  max-width: calc(100vw - 16px);
+  padding: 6px;
+  border: 1px solid #e3e9ed;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 28px #203e5424;
+}
+.file-action-menu .button {
+  justify-content: flex-start;
+  min-height: 38px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.file-action-menu .button:hover,
+.file-action-menu .button:focus-visible {
+  background: #f1f5f7;
+}
+.file-action-menu .button.danger {
+  border-top: 1px solid #edf2f5;
+  border-radius: 0 0 6px 6px;
+  margin-top: 3px;
 }
 .bulk-download {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
   margin: 16px 0;
+}
+.bulk-download .actions {
+  flex-wrap: wrap;
+}
+.bulk-selection-note {
+  font-size: 13px;
+}
+.bulk-selection-note small {
+  display: block;
+  margin-top: 5px;
+  color: #8799a6;
+  font-size: 11px;
+}
+.batch-report {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
 }
 .running-banner.floating-job {
   position: fixed;

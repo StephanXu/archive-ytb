@@ -6,8 +6,11 @@ import React, {
   type FormEvent,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   Archive,
+  Play,
+  Trash2,
   Layers3,
   Activity,
   KeyRound,
@@ -45,6 +48,7 @@ import type {
   ItemStatus,
 } from "../../shared/contracts";
 import { api, onUnauthorized } from "./api";
+import { selectionActions } from "../../shared/selection";
 import {
   Button,
   Badge,
@@ -549,6 +553,74 @@ function DiffWorkspace({
   action: Action;
   notify: (s: string) => void;
 }) {
+  const [batchProgress, setBatchProgress] = useState("");
+  const [batchReport, setBatchReport] = useState("");
+  const [fileMenu, setFileMenu] = useState<DiffItem | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuTrigger = useRef<HTMLButtonElement | null>(null);
+  const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 });
+  useEffect(() => {
+    if (!fileMenu) return;
+    const menu = menuRef.current;
+    const trigger = menuTrigger.current;
+    if (!menu || !trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const height = menu.getBoundingClientRect().height;
+    setMenuPosition({
+      left: Math.max(8, Math.min(rect.right - 224, window.innerWidth - 232)),
+      top:
+        rect.bottom + height + 8 <= window.innerHeight
+          ? rect.bottom + 6
+          : Math.max(8, rect.top - height - 6),
+    });
+    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    const outside = (event: PointerEvent) => {
+      if (
+        !menu.contains(event.target as Node) &&
+        !trigger.contains(event.target as Node)
+      )
+        setFileMenu(null);
+    };
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setFileMenu(null);
+        trigger.focus();
+      }
+      if (event.key === "Tab") setFileMenu(null);
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const buttons = [
+          ...menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+        ];
+        const current = buttons.indexOf(
+          document.activeElement as HTMLButtonElement,
+        );
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? buttons.length - 1
+              : (current +
+                  (event.key === "ArrowDown" ? 1 : -1) +
+                  buttons.length) %
+                buttons.length;
+        buttons[next]?.focus();
+      }
+    };
+    const dismiss = () => setFileMenu(null);
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", keyboard);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", keyboard);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    };
+  }, [fileMenu]);
+
   const [diff, setDiff] = useState<DiffPage>(),
     [filter, setFilter] = useState("all"),
     [order, setOrder] = useState<"desc" | "asc">("desc"),
@@ -561,6 +633,9 @@ function DiffWorkspace({
   const jobs = data.jobs.filter((j) => j.config_id === c.id),
     running = jobs.find(active);
   const jobStamp = jobs.map((j) => j.updated_at).join(",");
+  useEffect(() => {
+    setSelected(new Set());
+  }, [c.id, filter, query, offset, order]);
   useEffect(() => {
     const t = setTimeout(() => {
       setSearch(query);
@@ -588,8 +663,80 @@ function DiffWorkspace({
   async function run(path: string, body?: unknown, message?: string) {
     setPending(true);
     try {
-      await action(path, "POST", body, message);
-    } catch {
+      if (path.endsWith("/open-file") || path.endsWith("/open-folder")) {
+        notify("正在打开…");
+        await api(path, "POST", body);
+        notify(message || "已发送打开请求");
+      } else await action(path, "POST", body, message);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "操作失败");
+    } finally {
+      setPending(false);
+    }
+  }
+  async function deleteLocal(item: DiffItem) {
+    setPending(true);
+    try {
+      const path = `configs/${c.id}/delete-file`;
+      const preview = await api<{ confirmation: string; files: string[] }>(
+        path,
+        "POST",
+        { bv: item.bv },
+      );
+      if (
+        !window.confirm(
+          `确认永久删除「${item.title}」的以下本地视频文件？此操作无法撤销。\n\n${preview.files.join("\n")}\n\n删除后才可排除该条目。`,
+        )
+      )
+        return;
+      await action(
+        path,
+        "POST",
+        { bv: item.bv, confirmation: preview.confirmation },
+        "本地文件已删除，现在可以排除该条目",
+      );
+      setFileMenu(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除失败");
+      setFileMenu(null);
+    } finally {
+      setPending(false);
+    }
+  }
+  async function archive(bv: string) {
+    setPending(true);
+    notify("正在存档…");
+    try {
+      const path = `configs/${c.id}/archive`;
+      const result = await api<{
+        status: string;
+        hash: string;
+        source: string;
+        destination: string;
+      }>(path, "POST", { bv });
+      if (result.status === "duplicate") {
+        if (
+          !window.confirm(
+            `存档中已有同名文件，SHA-256 一致。是否直接删除下载目录中的重复文件？\n下载：${result.source}\n存档：${result.destination}\nSHA-256：${result.hash}\n删除后保留存档副本。`,
+          )
+        )
+          return;
+        await action(
+          path,
+          "POST",
+          { bv, confirmedHash: result.hash },
+          "已删除下载目录中的重复文件",
+        );
+      } else {
+        notify("已存档");
+      }
+      setDiff(
+        await api<DiffPage>(
+          `configs/${c.id}/diff?status=${filter}&search=${encodeURIComponent(search)}&offset=${offset}&order=${order}`,
+        ),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "存档失败");
     } finally {
       setPending(false);
     }
@@ -620,13 +767,179 @@ function DiffWorkspace({
   }
   const eligible =
     diff?.items.filter(
-      (i) => i.status === "missing" || i.status === "staged",
+      (i) =>
+        i.status === "missing" ||
+        ["staged", "archived"].includes(i.base_status),
     ) || [];
+  const batch = selectionActions(diff?.items || [], selected);
+  async function bulk(kind: "download" | "archive" | "delete") {
+    const items = batch[kind];
+    if (!items.length || pending || running) return;
+    setPending(true);
+    setBatchReport("");
+    const completed = new Set<string>();
+    const failures: string[] = [];
+    try {
+      if (kind === "download") {
+        await action(
+          `configs/${c.id}/download`,
+          "POST",
+          { snapshot_id: diff?.snapshot_id, selected: items.map((i) => i.bv) },
+          `已将所选 ${items.length} 项加入下载队列`,
+        );
+        items.forEach((i) => completed.add(i.bv));
+      } else if (kind === "delete") {
+        const previews: {
+          item: DiffItem;
+          confirmation: string;
+          files: string[];
+        }[] = [];
+        for (const [index, item] of items.entries()) {
+          setBatchProgress(`检查删除范围 ${index + 1}/${items.length}`);
+          try {
+            const preview = await api<{
+              confirmation: string;
+              files: string[];
+            }>(`configs/${c.id}/delete-file`, "POST", { bv: item.bv });
+            previews.push({ item, ...preview });
+          } catch (e) {
+            failures.push(
+              `${item.title}：${e instanceof Error ? e.message : "检查失败"}`,
+            );
+          }
+        }
+        if (
+          previews.length &&
+          window.confirm(
+            `确认永久删除所选 ${previews.length} 项的以下本地文件？包含列出的下载及存档副本，无法撤销。\n\n${previews.map((p) => `${p.item.title}\n${p.files.join("\n")}`).join("\n\n")}${failures.length ? `\n\n另有 ${failures.length} 项检查失败，不会删除。` : ""}`,
+          )
+        ) {
+          for (const [index, preview] of previews.entries()) {
+            setBatchProgress(`正在删除 ${index + 1}/${previews.length}`);
+            try {
+              await api(`configs/${c.id}/delete-file`, "POST", {
+                bv: preview.item.bv,
+                confirmation: preview.confirmation,
+              });
+              completed.add(preview.item.bv);
+            } catch (e) {
+              failures.push(
+                `${preview.item.title}：${e instanceof Error ? e.message : "删除失败"}`,
+              );
+            }
+          }
+        }
+      } else {
+        for (const [index, item] of items.entries()) {
+          setBatchProgress(`正在存档 ${index + 1}/${items.length}`);
+          try {
+            const path = `configs/${c.id}/archive`;
+            const result = await api<{
+              status: string;
+              hash?: string;
+              source: string;
+              destination: string;
+            }>(path, "POST", { bv: item.bv });
+            if (result.status === "duplicate") {
+              if (
+                !window.confirm(
+                  `「${item.title}」存在同名且 SHA-256 一致的存档，是否删除下载副本？\n下载：${result.source}\n存档：${result.destination}`,
+                )
+              )
+                continue;
+              await api(path, "POST", {
+                bv: item.bv,
+                confirmedHash: result.hash,
+              });
+            }
+            completed.add(item.bv);
+          } catch (e) {
+            failures.push(
+              `${item.title}：${e instanceof Error ? e.message : "存档失败"}`,
+            );
+          }
+        }
+      }
+    } catch (e) {
+      failures.push(e instanceof Error ? e.message : "批量操作失败");
+    } finally {
+      if (kind !== "download") {
+        try {
+          await action("state", "GET");
+        } catch {
+          failures.push("列表更新失败，请刷新页面确认结果");
+        }
+      }
+      setSelected(
+        (prev) => new Set([...prev].filter((bv) => !completed.has(bv))),
+      );
+      setBatchReport(
+        `${kind === "download" ? "已加入下载队列" : kind === "archive" ? "已存档" : "已删除"} ${completed.size} 项${failures.length ? `；失败 ${failures.length} 项：\n${failures.join("\n")}` : ""}`,
+      );
+      setBatchProgress("");
+      setPending(false);
+    }
+  }
   const total = diff
     ? Object.values(diff.counts).reduce((a, b) => a + b, 0)
     : 0;
   return (
     <>
+      {fileMenu &&
+        createPortal(
+          <div
+            ref={menuRef}
+            id="file-action-menu"
+            role="menu"
+            aria-label="本地文件操作"
+            className="file-action-menu"
+            style={menuPosition}
+          >
+            <Button
+              role="menuitem"
+              disabled={pending}
+              onClick={() => {
+                setFileMenu(null);
+                void run(
+                  `configs/${c.id}/open-folder`,
+                  { bv: fileMenu.bv },
+                  "已打开视频所在文件夹",
+                );
+              }}
+            >
+              <Folder size={18} />
+              打开所在文件夹
+            </Button>
+            {fileMenu.base_status === "staged" && (
+              <Button
+                role="menuitem"
+                disabled={pending || !!running}
+                onClick={() => {
+                  const bv = fileMenu.bv;
+                  setFileMenu(null);
+                  void archive(bv);
+                }}
+              >
+                <Archive size={18} />
+                转移到存档目录
+              </Button>
+            )}
+            <Button
+              role="menuitem"
+              variant="danger"
+              disabled={pending || !!running}
+              onClick={() => deleteLocal(fileMenu)}
+            >
+              <Trash2 size={18} />
+              {pending
+                ? "正在检查文件…"
+                : fileMenu.base_status === "archived"
+                  ? "删除本地文件（含存档）"
+                  : "删除下载文件"}
+            </Button>
+          </div>,
+          document.body,
+        )}
       <a className="back-link" href="#configs">
         <ArrowLeft size={15} />
         全部配置
@@ -759,12 +1072,18 @@ function DiffWorkspace({
                     <th>
                       <input
                         type="checkbox"
-                        aria-label="选择本页可下载条目"
+                        aria-label="选择本页可操作条目"
+                        ref={(el) => {
+                          if (el)
+                            el.indeterminate =
+                              eligible.some((i) => selected.has(i.bv)) &&
+                              !eligible.every((i) => selected.has(i.bv));
+                        }}
                         checked={
                           eligible.length > 0 &&
                           eligible.every((i) => selected.has(i.bv))
                         }
-                        disabled={!eligible.length}
+                        disabled={pending || !eligible.length}
                         onChange={(e) => {
                           const checked = e.target.checked;
                           setSelected((prev) => {
@@ -804,11 +1123,13 @@ function DiffWorkspace({
                   {diff.items.map((i) => (
                     <tr key={i.bv}>
                       <td>
-                        {["missing", "staged"].includes(i.status || "") && (
+                        {(i.status === "missing" ||
+                          ["staged", "archived"].includes(i.base_status)) && (
                           <input
                             type="checkbox"
                             aria-label={"选择 " + i.title}
                             checked={selected.has(i.bv)}
+                            disabled={pending}
                             onChange={(e) => select(i.bv, e.target.checked)}
                           />
                         )}
@@ -901,20 +1222,48 @@ function DiffWorkspace({
                               <LoaderCircle size={16} className="spin" />
                             </Button>
                           ) : ["archived", "staged"].includes(i.base_status) ? (
-                            <Button
-                              variant="quiet icon-button"
-                              title="查看本地文件夹"
-                              aria-label={"查看本地文件夹 " + i.title}
-                              onClick={() =>
-                                run(
-                                  `configs/${c.id}/open-folder`,
-                                  { bv: i.bv },
-                                  "已打开视频所在文件夹",
-                                )
-                              }
-                            >
-                              <Folder size={16} />
-                            </Button>
+                            <>
+                              <Button
+                                variant="quiet icon-button"
+                                disabled={pending}
+                                title="打开文件"
+                                aria-label={"打开文件 " + i.title}
+                                onClick={() =>
+                                  run(
+                                    `configs/${c.id}/open-file`,
+                                    { bv: i.bv },
+                                    "已打开文件",
+                                  )
+                                }
+                              >
+                                <Play size={16} />
+                              </Button>
+                              <Button
+                                variant="quiet icon-button"
+                                disabled={pending}
+                                title="更多文件操作"
+                                aria-label={"更多文件操作 " + i.title}
+                                aria-haspopup="menu"
+                                aria-expanded={fileMenu?.bv === i.bv}
+                                aria-controls={
+                                  fileMenu?.bv === i.bv
+                                    ? "file-action-menu"
+                                    : undefined
+                                }
+                                onClick={(event) => {
+                                  menuTrigger.current = event.currentTarget;
+                                  const rect =
+                                    event.currentTarget.getBoundingClientRect();
+                                  setMenuPosition({
+                                    top: rect.bottom + 6,
+                                    left: Math.max(8, rect.right - 224),
+                                  });
+                                  setFileMenu(fileMenu?.bv === i.bv ? null : i);
+                                }}
+                              >
+                                <Ellipsis size={16} />
+                              </Button>
+                            </>
                           ) : (
                             <Button
                               variant="quiet icon-button"
@@ -937,21 +1286,24 @@ function DiffWorkspace({
                               <Download size={16} />
                             </Button>
                           )}
-                          <Button
-                            variant="quiet icon-button"
-                            title={i.status === "excluded" ? "恢复" : "排除"}
-                            aria-label={
-                              (i.status === "excluded" ? "恢复 " : "排除 ") +
-                              i.title
-                            }
-                            onClick={() => exclude(i)}
-                          >
-                            {i.status === "excluded" ? (
-                              <Undo2 size={16} />
-                            ) : (
-                              <Ban size={16} />
-                            )}
-                          </Button>
+                          {!["archived", "staged"].includes(i.base_status) && (
+                            <Button
+                              variant="quiet icon-button"
+                              title={i.status === "excluded" ? "恢复" : "排除"}
+                              aria-label={
+                                (i.status === "excluded" ? "恢复 " : "排除 ") +
+                                i.title
+                              }
+                              disabled={pending || !!running}
+                              onClick={() => exclude(i)}
+                            >
+                              {i.status === "excluded" ? (
+                                <Undo2 size={16} />
+                              ) : (
+                                <Ban size={16} />
+                              )}
+                            </Button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -1002,32 +1354,51 @@ function DiffWorkspace({
           </>
         )}
       </section>
-      <div className="bulk-download">
-        {" "}
-        <Button
-          variant="primary"
-          disabled={
-            !!running ||
-            pending ||
-            !diff?.snapshot_id ||
-            !(diff.counts.missing + diff.counts.staged)
-          }
-          onClick={async () => {
-            await run(
-              `configs/${c.id}/download`,
-              {
-                snapshot_id: diff?.snapshot_id,
-                ...(selected.size ? { selected: [...selected] } : {}),
-              },
-              "已加入下载队列",
-            );
-            setSelected(new Set());
-          }}
-        >
-          <Download size={16} />
-          {selected.size ? `下载所选 (${selected.size})` : "下载待处理"}
-        </Button>
+      <div className="bulk-download" aria-label="所选条目批量操作">
+        <span className="bulk-selection-note">
+          {batchProgress || `本页已选 ${batch.chosen.length} 项`}
+          <small>仅处理勾选项；翻页或切换筛选会清空选择</small>
+        </span>
+        <div className="actions">
+          <Button
+            title="下载勾选的待下载条目"
+            disabled={
+              !!running ||
+              pending ||
+              !diff?.snapshot_id ||
+              !batch.download.length
+            }
+            onClick={() => bulk("download")}
+          >
+            <Download size={16} />
+            下载所选 ({batch.download.length})
+          </Button>
+          <Button
+            title={c.library_dir ? "转移勾选的已下载条目" : "请先设置存档目录"}
+            disabled={
+              !!running || pending || !c.library_dir || !batch.archive.length
+            }
+            onClick={() => bulk("archive")}
+          >
+            <Archive size={16} />
+            存档所选 ({batch.archive.length})
+          </Button>
+          <Button
+            variant="danger"
+            title="确认后删除勾选条目的本地文件"
+            disabled={!!running || pending || !batch.delete.length}
+            onClick={() => bulk("delete")}
+          >
+            <Trash2 size={16} />
+            删除所选 ({batch.delete.length})
+          </Button>
+        </div>
       </div>
+      {batchReport && (
+        <p className="batch-report" role="status">
+          {batchReport}
+        </p>
+      )}
       <div className="directory-bar">
         <Folder size={17} />
         <div>
@@ -1053,7 +1424,7 @@ function DiffWorkspace({
         </Button>
       </div>
       <Note>
-        「已下载」表示下载目录中已有视频，仅在画质核验异常时额外标注。发布日期缺失时会在下载预检中按日期下限过滤。「源中移除」不会删除本地文件。打开目录的操作发生在服务电脑上。
+        「已下载」表示下载目录中已有视频，仅在画质核验异常时额外标注。发布日期缺失时会在下载预检中按日期下限过滤。「源中移除」不会删除本地文件。打开文件和目录的操作发生在服务电脑上。存档会转移下载文件；同名且哈希不同时阻止操作，相同时确认后删除下载副本。
       </Note>
     </>
   );
