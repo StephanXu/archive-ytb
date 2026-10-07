@@ -1,18 +1,24 @@
 import { useState, type FormEvent } from "react";
 import { Check, Trash2 } from "lucide-react";
-import type { BackupConfig, CookieSource } from "../../shared/contracts";
+import type {
+  BackupConfig,
+  CookieSource,
+  StorageSource,
+} from "../../shared/contracts";
 import { api } from "./api";
 import { Modal, Field, Button } from "./ui";
 
 export function ConfigEditor({
   config,
   cookies,
+  storages,
   close,
   saved,
   remove,
 }: {
   config?: BackupConfig;
   cookies: CookieSource[];
+  storages: StorageSource[];
   close: () => void;
   saved: () => void;
   remove?: (id: string) => void;
@@ -45,7 +51,7 @@ export function ConfigEditor({
   return (
     <Modal
       title={config ? "编辑备份配置" : "新建备份配置"}
-      description="添加内容来源，选择登录态，再预览与本地的差异。"
+      description="添加内容来源，选择登录态和存储源，再预览差异。"
       close={close}
     >
       <form onSubmit={submit}>
@@ -80,25 +86,31 @@ export function ConfigEditor({
             </select>
           </Field>
           <Field
-            label="存档目录（可选）"
-            hint="已有视频库，仅用于比对；不会向这里下载或删除文件。"
+            label="存储源（可选）"
+            hint="在存储管理中配置位置，这里通过名字引用。"
             wide
           >
-            <input
-              name="library_dir"
-              defaultValue={config?.library_dir}
-              placeholder="已归档视频所在的绝对路径"
-            />
+            <select
+              name="storage_name"
+              defaultValue={config?.storage_name || ""}
+            >
+              <option value="">暂不存档</option>
+              {storages.map((s) => (
+                <option key={s.id} value={s.name}>
+                  {s.name} · {s.kind === "local" ? "本地" : "云端"}
+                </option>
+              ))}
+            </select>
           </Field>
           <Field
-            label="独立下载目录（可选）"
-            hint="留空时使用「统一下载根目录 / 配置名」。"
+            label="中转目录（可选）"
+            hint="用于下载、合并和校验，留空使用默认目录；最终存档位置由存储源决定。"
             wide
           >
             <input
               name="download_dir"
               defaultValue={config?.download_dir}
-              placeholder="使用统一下载目录"
+              placeholder="默认：统一中转根目录 / 配置名"
             />
           </Field>
           <Field label="仅处理晚于此日期的内容">
@@ -107,6 +119,24 @@ export function ConfigEditor({
               type="date"
               defaultValue={config?.after_date}
             />
+          </Field>
+          <Field
+            label="存档目录结构"
+            hint="按视频发布日期整理最终存档；日期未知时放在根目录。修改设置不会移动已有文件。"
+          >
+            <select
+              name="directory_template"
+              defaultValue={config?.directory_template || ""}
+            >
+              <option value="">平铺（默认）</option>
+              <option value="{{YYYY}}/{{MM}}/">
+                {"{{YYYY}}/{{MM}}/ · 2026/08/"}
+              </option>
+              <option value="{{YYYY}}-{{MM}}/">
+                {"{{YYYY}}-{{MM}}/ · 2026-08/"}
+              </option>
+              <option value="{{YYYY}}/">{"{{YYYY}}/ · 2026/"}</option>
+            </select>
           </Field>
           <Field
             label="自动检查间隔（分钟）"

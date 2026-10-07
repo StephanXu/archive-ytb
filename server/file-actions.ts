@@ -7,6 +7,7 @@ import {
   lstat,
   realpath,
   link,
+  mkdir,
 } from "node:fs/promises";
 import { basename, join, relative, isAbsolute } from "node:path";
 import { scanMedia } from "./paths.ts";
@@ -31,7 +32,10 @@ export async function archiveFile(
   library: string,
   bv: string,
   confirmedHash?: string,
+  subdirectory = "",
 ) {
+  if (subdirectory && !/^\d{4}(?:\/\d{2}|-\d{2})?$/.test(subdirectory))
+    throw new TaskError("VALIDATION", "存档子目录格式无效");
   const roots = await Promise.all([realpath(download), realpath(library)]);
   const nested = (a: string, b: string) => {
     const r = relative(a, b);
@@ -81,7 +85,24 @@ export async function archiveFile(
   }
   if (confirmedHash)
     throw new TaskError("CONFLICT", "原存档文件已变化，请重新存档");
-  const destination = join(library, basename(source));
+  let targetDirectory = library;
+  for (const part of subdirectory.split("/").filter(Boolean)) {
+    targetDirectory = join(targetDirectory, part);
+    try {
+      const info = await lstat(targetDirectory);
+      if (!info.isDirectory() || info.isSymbolicLink())
+        throw new TaskError(
+          "CONFLICT",
+          "存档子目录不是普通目录，请检查目录链接",
+        );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await mkdir(targetDirectory);
+    }
+    if (!nested(roots[1], await realpath(targetDirectory)))
+      throw new TaskError("CONFLICT", "存档子目录超出存储源，请检查目录链接");
+  }
+  const destination = join(targetDirectory, basename(source));
   // link + unlink moves the same file on a supporting volume without copying bytes.
   // Unlike rename on Windows/POSIX, link cannot overwrite an existing destination.
   let linked = false;

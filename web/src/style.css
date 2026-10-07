@@ -910,6 +910,18 @@ tr:hover td {
 .job-card summary {
   cursor: pointer;
 }
+.job-card pre {
+  color: #6c3333;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f5f8fa;
+  max-height: 260px;
+  overflow-y: auto;
+}
 .job-card ul {
   padding-left: 18px;
 }

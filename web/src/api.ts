@@ -27,7 +27,11 @@ export async function api<T = unknown>(
   }
   if (!r.ok) {
     if (r.status === 401) unauthorized();
-    throw Error(data.detail || "操作失败");
+    throw Error(
+      [data.detail || "操作失败", data.error_details]
+        .filter(Boolean)
+        .join("\n"),
+    );
   }
   return data;
 }

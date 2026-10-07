@@ -3,6 +3,7 @@
 ```mermaid
 flowchart LR
   UI[React 界面] --> API[Express API / 共享 Zod 校验]
+  API --> CONFIG[config.toml / 项目配置唯一来源]
   API --> DB[(SQLite WAL)]
   API --> Q[持久化任务队列]
   TIMER[间隔调度] --> Q
@@ -10,6 +11,12 @@ flowchart LR
   WORKER --> COOKIE[Cookie 实例 / 临时任务凭据]
   WORKER --> DLP[固定版本 yt-dlp 子进程]
   WORKER --> FS[异步文件索引 / ffprobe]
+  API --> STORAGE[命名存储源 / StorageManager]
+  WORKER --> STORAGE
+  STORAGE --> FS
+  STORAGE --> SDK[rclone-sdk]
+  SDK --> RC[项目内 rclone RC 子进程]
+  RC --> CLOUD[OneDrive / S3 / 其他远端]
   WORKER --> DB
 ```
 
@@ -17,10 +24,21 @@ flowchart LR
 - `engine.ts` 管理调度、任务状态、snapshot、排除规则与执行流程。
 - `downloader.ts` 封装 Cookie 解析/验证、最高格式选择、下载与成品检查。
 - `process.ts` 统一无 shell 子进程执行、输出限额、超时、取消和错误脱敏。Windows 取消使用进程树终止，Unix 使用进程组终止。
-- `store.ts` 提供参数化 SQLite 存取和事务，持久化配置、凭据元信息、快照、任务与完成凭证。
+- `config-file.ts` 校验、加载和原子发布版本化的 TOML 项目配置；保存前比较文件内容，阻止覆盖服务运行期间的外部修改。配置文件不通过 API 返回。
+- `store.ts` 将全局设置、合集与排除规则、Cookie 定义/导入内容、存储源路由到 TOML，SQLite 仅持久化运行状态、快照、任务与完成凭证。界面仍使用相同资源 API，读取时组合配置与运行状态，不回显 Cookie 原文。嵌套事务在最外层一次发布文件，发布失败回滚本次 SQLite 变更；文件先发布再提交数据库，崩溃后以配置文件为准并重新检查缓存指纹。
+- `storage.ts` 管理名字到本地/云端位置的映射、旧路径迁移、远端索引、存档、取回和删除；配置通过 `storage_name` 引用。
+- RC 的本地文件操作使用局部 `:local,encoding=Raw:` 保留原生全角标点（例如 Windows 文件名中的 `？`），远端继续使用用户的 encoding。已有副本同时按文件名/BV 检查并保留原路径。取回在临时目录保留本机兼容的原名；远端暴露的 Windows 非法半角字符由本地默认 encoding 转换，再校验、独占发布。
+- `rclone-client.ts` 使用开源 `rclone-sdk` 调用 RC API，管理项目内固定版本 rclone 的进程生命周期，将异步 job 与任务取消/进度连接。全局文件锁避免与下载、修改配置交错；每次 RC 调用使用独立 stats group，结束后释放。
+- 云端失败保留 RC 提交响应、job/status 错误或启动错误中的原因，附带失败阶段；`storage-errors.ts` 只提取已知诊断字段，并隐藏配置凭据、鉴权头及 URL 查询参数。`TaskError.details` 经任务/单条 failures 持久化，也用于直接 API 错误响应；界面失败任务默认展开详情。历史记录没有保存的原始错误无法重建。
+- `media-layout.ts` 按发布日期生成白名单内的存档子目录。中转文件保持原位置，存档到本地/云端时才应用规则；日期未知平铺。本地逐级创建普通目录，拒绝符号链接与路径越界；同名检查仍扫描整个存储源，以保留旧位置的重复文件保护。
+- `POST /api/storage-config` 接收完整 rclone 配置文本，先用独立的项目内 RC 子进程解析、检查远端与类型，再关闭现有子进程并原子替换托管文件。导入切换到托管配置并使云端快照及校验记录失效；外部配置文件和已有视频保持不变。`GET /api/storage-config` 仅返回远端名，配置与令牌不进入 API 响应。
 - `shared/contracts.ts` 给客户端类型约束，给服务端运行时输入校验。
 
 ## 快照与运行一致性
+
+项目配置默认为 `state/config.toml`，可用 `BACKUP_CONFIG_FILE` 将其与运行目录分开。首次升级在原配置仍完整保留时发布 TOML，成功后才移除 SQLite 配置行。上传的 Cookie 原文嵌入 TOML，执行副本按内容指纹写入运行目录；验证状态与下次执行时间单独留在 SQLite，日常任务不会改写 TOML。相对路径以 TOML 所在目录为基准。
+
+手动编辑在重启后加载；来源、凭据或有效路径变化通过配置指纹使相关旧快照失效，仅改合集显示名称继续保留快照。新数据库会重新建立计划和 Cookie 执行副本，无需携带快照、封面或任务历史。引用外部 Cookie 文件和浏览器登录态仍需在新主机自行准备。
 
 打开页面只读取存储的配置和快照；diff 每页最多 200 条，界面默认 100 条。标题/BV 搜索有防抖，筛选和选中状态由 React 管理。后台轮询不会重建输入框或抢走焦点。
 
@@ -46,12 +64,12 @@ flowchart LR
 
 ## 媒体档案与封面
 
-SQLite 新增以下表，旧 documents 配置/任务/快照继续保留，启动时幂等导入已有快照和下载凭证：
+SQLite 包含以下表，documents 保留任务/快照/完成凭证，启动时幂等导入已有快照和下载凭证；旧配置在 TOML 成功发布后移出数据库：
 
 - media：内部作品 UUID，不与 BV 或 YouTube ID 绑定。
 - media_sources：来源 UUID、media_id、platform、external_id、标题、URL、发布日期、封面 URL。UNIQUE(platform, external_id)，ID 保留大小写；同一作品可以关联多个来源，不按标题自动合并。
 - media_collections：配置与来源的多对多关系，present 标记当前是否仍在来源列表；源移除不删除媒体档案。
-- media_files：来源与本地文件路径关系，保存下载核验 metadata；同一来源可以对应多个文件。
+- media_files：来源与文件位置关系（本地路径或 rclone 远端路径），保存下载核验 metadata；同一来源可以对应多个文件。打开时只接受当前配置根目录内的真实本地路径。
 - media_covers：按来源保存图片 BLOB、MIME、原 URL 和更新时间。图片独立于快照，可在凭据失效、断网时继续通过受鉴权保护的 API 读取。
 
 后台串行缓存封面，不阻塞快照发布，不带 Cookie；限定公开图片 CDN、禁用重定向、限制单图 4 MB、检查图片签名。失败保留旧图片，下次启动或刷新重试。浏览器在图片接近视口时读取本地封面，没有缓存时暂用原 URL。
@@ -59,3 +77,5 @@ SQLite 新增以下表，旧 documents 配置/任务/快照继续保留，启动
 新下载传入 --write-thumbnail、--embed-thumbnail、--embed-metadata：封面独立文件保留在下载目录，并嵌入视频。已有视频不会因升级自动重封装。数据库已为多平台扩展留出来源与作品分层；当前配置入口和下载流程仍只支持 Bilibili，尚未新增 YouTube 下载支持。
 
 备份时请使用 SQLite backup API，或停止服务后复制完整 state 目录；不要在运行时只复制主数据库文件而忽略 WAL。
+
+`documents` 增加 `storages`（唯一名称、类型、根路径）和 `cloud_receipts`（存储源 ID/BV、已校验远端位置、SHA-256）。云端副本读取失败不会发布新的空索引；对已有同名远端先比较内容，禁止覆盖。上传后完整读取云端计算 SHA-256，本地文件身份/内容再次核验后才能删除；取回使用临时目录和不覆盖的发布操作。云端完成凭证在清理本地前持久化，服务重启后可重新扫描、确认重复副本并重试。

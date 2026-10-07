@@ -1,0 +1,39 @@
+# 复制到 state/config.toml，或通过 BACKUP_CONFIG_FILE 指定文件。
+# 相对文件系统路径以本文件所在目录为基准；ID 用于保持关联，请勿随意更改。
+version = 1
+
+[settings]
+# download_root 可省略，默认 ~/Downloads/ArchiveFlow，仅作为本地中转位置。
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+rclone_config = "" # 使用本文件旁的独立 rclone.conf
+
+[[storages]]
+id = "video-library"
+name = "视频库"
+kind = "local"
+root = "../videos"
+
+[[cookies]]
+id = "bilibili-account"
+name = "B 站账号"
+kind = "file" # upload 会将 Netscape Cookie 原文存入 content；browser 引用服务主机浏览器
+path = "../cookies.txt"
+content = ""
+browser = "chrome"
+profile = ""
+
+[[configs]]
+id = "my-collection"
+name = "我的合集"
+season_url = "https://space.bilibili.com/123/lists/456"
+cookie_id = "bilibili-account"
+storage_name = "视频库"
+library_dir = ""
+# download_dir 可省略，默认使用「统一中转根目录 / 配置名」。
+# 存档按视频发布日期整理；留空平铺。也支持 {{YYYY}}-{{MM}}/ 或 {{YYYY}}/。
+directory_template = ""
+after_date = ""
+interval_minutes = 0
+auto_download = false
+excluded = []

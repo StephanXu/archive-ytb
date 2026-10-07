@@ -4,6 +4,7 @@ export class TaskError extends Error {
   constructor(
     public code: string,
     message: string,
+    public details?: string,
   ) {
     super(message);
   }
@@ -14,6 +15,7 @@ export type RunOptions = {
   onLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
   maxOutput?: number;
+  failureMessage?: string;
 };
 function terminate(child: ChildProcess) {
   if (!child.pid) return;
@@ -96,7 +98,8 @@ export function runProcess(
       reject(
         new TaskError(
           "TOOL_MISSING",
-          "无法启动工具，请检查 yt-dlp / ffmpeg / ffprobe 安装",
+          opts.failureMessage ||
+            "无法启动工具，请检查 yt-dlp / ffmpeg / ffprobe 安装",
         ),
       );
     });
@@ -117,7 +120,8 @@ export function runProcess(
             cookie ? "BROWSER_COOKIE" : "EXTRACTOR_FAILED",
             cookie
               ? "浏览器 Cookie 无法读取或解密；可导入文件或改用 Firefox。"
-              : "yt-dlp 或媒体工具执行失败，请检查来源、网络和工具版本。",
+              : opts.failureMessage ||
+                  "yt-dlp 或媒体工具执行失败，请检查来源、网络和工具版本。",
           ),
         );
         return;

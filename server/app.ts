@@ -1,4 +1,4 @@
-import { archiveFile, fileIdentity } from "./file-actions.ts";
+import { fileIdentity } from "./file-actions.ts";
 import express from "express";
 import { z } from "zod";
 import { timingSafeEqual, randomUUID } from "node:crypto";
@@ -10,13 +10,16 @@ import {
   configSchema,
   cookieSchema,
   settingsSchema,
+  storageSchema,
   bvSchema,
   DOWNLOADER_VERSION,
+  RCLONE_VERSION,
   type BackupConfig,
   type CookieSource,
   type Settings,
   type Snapshot,
   type Job,
+  type StorageSource,
 } from "../shared/contracts.ts";
 import { Engine, now } from "./engine.ts";
 import { Store } from "./store.ts";
@@ -29,10 +32,13 @@ import {
   scanMedia,
 } from "./paths.ts";
 import { TaskError } from "./process.ts";
+import { remotePath } from "./storage.ts";
+import { RcloneClient } from "./rclone-client.ts";
 
 export function createApp({
   root,
   stateDir,
+  configPath,
   legacy,
   token = "",
   downloader,
@@ -40,12 +46,13 @@ export function createApp({
 }: {
   root: string;
   stateDir: string;
+  configPath?: string;
   legacy?: string;
   token?: string;
   downloader?: Downloader;
   openPath?: typeof openLocalPath;
 }) {
-  const store = new Store(stateDir),
+  const store = new Store(stateDir, configPath),
     engine = new Engine(store, downloader || new Downloader(root), legacy),
     app = express();
   app.disable("x-powered-by");
@@ -115,6 +122,7 @@ export function createApp({
     res.json({
       configs: engine.views(),
       cookies: store.all("cookies"),
+      storages: store.all("storages"),
       settings: s,
       jobs: store
         .all<Job>("jobs")
@@ -127,6 +135,9 @@ export function createApp({
         ffprobe_available: await executable(s.ffprobe),
         platform: process.platform,
         remote: !!token,
+        rclone_available: await executable(engine.storage.binary),
+        rclone_version: RCLONE_VERSION,
+        config_file: store.configuration.path,
       },
     });
   });
@@ -135,6 +146,15 @@ export function createApp({
     const body = configSchema.parse(input);
     if (body.cookie_id && !store.get("cookies", body.cookie_id))
       throw new TaskError("VALIDATION", "Cookie 实例不存在");
+    if (
+      body.storage_name &&
+      !store
+        .all<StorageSource>("storages")
+        .some((s) => s.name === body.storage_name)
+    )
+      throw new TaskError("VALIDATION", "存储源不存在，请先在存储管理中添加");
+    if (body.storage_name && body.library_dir)
+      throw new TaskError("VALIDATION", "请选择存储源，不要同时填写旧存档目录");
     if (
       store
         .all<BackupConfig>("configs")
@@ -164,6 +184,7 @@ export function createApp({
             "season_url",
             "cookie_id",
             "library_dir",
+            "storage_name",
             "download_dir",
             "after_date",
           ] as const
@@ -241,13 +262,12 @@ export function createApp({
     const added = body.excluded.filter((bv) => !c.excluded.includes(bv));
     if (added.length) {
       engine.idle();
-      for (const root of [
-        c.library_dir ? expandPath(c.library_dir) : "",
-        engine.downloadDir(c),
-      ].filter(Boolean)) {
-        const files = await scanMedia(root);
+      for (const files of await Promise.all([
+        engine.storage.scan(c),
+        scanMedia(engine.downloadDir(c)),
+      ])) {
         if (added.some((bv) => files.has(bv)))
-          throw new TaskError("CONFLICT", "请先删除本地文件，再排除该条目");
+          throw new TaskError("CONFLICT", "请先删除存储中的文件，再排除该条目");
       }
     }
     c.excluded = [...new Set(body.excluded)];
@@ -285,28 +305,23 @@ export function createApp({
   });
   async function saveCookie(id: string, input: unknown) {
     engine.idle();
+    const previous = store.get<CookieSource>("cookies", id);
     const body = cookieSchema.parse(input);
     const { content, ...rest } = body;
     const source: CookieSource = { ...rest, id, status: "未验证" };
-    if (source.kind === "upload") {
-      const safeText = serializeCookies(parseCookies(content));
-      const path = join(engine.cookieDir, `${id}.txt`),
-        tmp = path + ".new";
-      // Bounded (< 1 MB) atomic write keeps source replacement and DB update
-      // in the same event-loop turn, so a queued job cannot read half an update.
-      try {
-        writeFileSync(tmp, safeText, { mode: 0o600 });
-        renameSync(tmp, path);
-        source.path = path;
-      } finally {
-        if (existsSync(tmp)) unlinkSync(tmp);
-      }
-    } else if (source.kind === "file") {
+    const managedContent =
+      source.kind === "upload" ? serializeCookies(parseCookies(content)) : "";
+    if (source.kind === "file") {
       if (!source.path.trim())
         throw new TaskError("VALIDATION", "请输入 Cookie 文件路径");
       source.path = expandPath(source.path);
     }
-    const saved = store.put("cookies", id, source);
+    const saved = store.put("cookies", id, {
+      ...source,
+      content: managedContent,
+    });
+    if (previous?.kind === "upload" && previous.path !== saved.path)
+      await unlink(previous.path).catch(() => {});
     const managed = join(engine.cookieDir, `${id}.txt`);
     if (source.kind !== "upload" && existsSync(managed)) unlinkSync(managed);
     return saved;
@@ -329,7 +344,7 @@ export function createApp({
       throw new TaskError("CONFLICT", "请先解除配置与此 Cookie 的关联");
     const c = store.get<CookieSource>("cookies", req.params.id);
     store.delete("cookies", req.params.id);
-    if (c) await unlink(join(engine.cookieDir, `${c.id}.txt`)).catch(() => {});
+    if (c?.kind === "upload") await unlink(c.path).catch(() => {});
     res.json({ ok: true });
   });
   app.post("/api/cookies/:id/verify", (req, res) => {
@@ -337,16 +352,157 @@ export function createApp({
       throw new TaskError("NOT_FOUND", "Cookie 实例不存在");
     res.json(engine.enqueue("cookie", undefined, { cookie_id: req.params.id }));
   });
-  app.put("/api/settings", (req, res) => {
+  app.put("/api/settings", async (req, res) => {
     engine.idle();
     const body = settingsSchema.parse(req.body);
     body.download_root = expandPath(body.download_root);
-    store.transaction(() => {
-      store.put<Settings>("settings", "global", body);
-      for (const c of store.all<BackupConfig>("configs"))
-        if (!c.download_dir) store.delete("snapshots", c.id);
+    engine.fileOperation = true;
+    try {
+      await engine.storage.rpc.close();
+      store.transaction(() => {
+        store.put<Settings>("settings", "global", body);
+        for (const c of store.all<BackupConfig>("configs"))
+          if (!c.download_dir) store.delete("snapshots", c.id);
+      });
+      res.json(body);
+    } finally {
+      engine.fileOperation = false;
+    }
+  });
+  app.get("/api/storage-config", async (_req, res) => {
+    engine.idle();
+    engine.fileOperation = true;
+    try {
+      const path = engine.settings().rclone_config
+        ? expandPath(engine.settings().rclone_config!)
+        : join(dirname(store.configuration.path), "rclone.conf");
+      res.json({
+        remotes: (await exists(path)) ? await engine.storage.rpc.remotes() : [],
+      });
+    } finally {
+      engine.fileOperation = false;
+    }
+  });
+  app.post("/api/storage-config", async (req, res) => {
+    engine.idle();
+    const { content } = z
+      .object({
+        content: z
+          .string()
+          .min(1)
+          .max(1024 * 1024),
+      })
+      .parse(req.body);
+    if (Buffer.byteLength(content) > 1024 * 1024 || content.includes("\0"))
+      throw new TaskError("VALIDATION", "请导入不超过 1 MB 的文本配置文件");
+    const path = join(dirname(store.configuration.path), "rclone.conf"),
+      tmp = join(
+        dirname(store.configuration.path),
+        `.rclone-import-${randomUUID()}.conf`,
+      ),
+      reader = new RcloneClient(engine.storage.binary, () => tmp);
+    engine.fileOperation = true;
+    try {
+      writeFileSync(tmp, content.replace(/^\uFEFF/, ""), { mode: 0o600 });
+      const remotes = await reader.remotes(true);
+      if (!remotes.length)
+        throw new TaskError(
+          "VALIDATION",
+          "配置中没有远端，请导入包含 [远端名] 的完整 rclone.conf",
+        );
+      await reader.close();
+      await engine.storage.rpc.close();
+      // Always import into the service-owned file. External config references
+      // remain untouched; failures before installation preserve the old config.
+      renameSync(tmp, path);
+      store.transaction(() => {
+        store.put<Settings>("settings", "global", {
+          ...engine.settings(),
+          rclone_config: "",
+        });
+        const clouds = new Set(
+          store
+            .all<StorageSource>("storages")
+            .filter((s) => s.kind === "rclone")
+            .map((s) => s.name),
+        );
+        for (const c of store.all<BackupConfig>("configs"))
+          if (c.storage_name && clouds.has(c.storage_name))
+            store.delete("snapshots", c.id);
+        store.db
+          .prepare("DELETE FROM documents WHERE kind='cloud_receipts'")
+          .run();
+      });
+      res.json({ remotes });
+    } finally {
+      await reader.close();
+      if (existsSync(tmp)) unlinkSync(tmp);
+      engine.fileOperation = false;
+    }
+  });
+  function saveStorage(id: string, input: unknown) {
+    engine.idle();
+    const value: StorageSource = { ...storageSchema.parse(input), id };
+    if (value.kind === "local") value.root = expandPath(value.root);
+    else remotePath(value.root);
+    if (
+      store
+        .all<StorageSource>("storages")
+        .some(
+          (s) =>
+            s.id !== id && s.name.toLowerCase() === value.name.toLowerCase(),
+        )
+    )
+      throw new TaskError("CONFLICT", "存储源名称已存在");
+    const old = store.get<StorageSource>("storages", id);
+    return store.transaction(() => {
+      store.put("storages", id, value);
+      for (const c of store.all<BackupConfig>("configs")) {
+        if (!old || c.storage_name !== old.name) continue;
+        store.put("configs", c.id, { ...c, storage_name: value.name });
+        if (old?.root !== value.root || old?.kind !== value.kind)
+          store.delete("snapshots", c.id);
+      }
+      if (old && (old.root !== value.root || old.kind !== value.kind)) {
+        for (const row of store.db
+          .prepare("SELECT id FROM documents WHERE kind='cloud_receipts'")
+          .all() as { id: string }[])
+          if (row.id.startsWith(id + ":"))
+            store.delete("cloud_receipts", row.id);
+      }
+      return value;
     });
-    res.json(body);
+  }
+  app.post("/api/storages", (req, res) =>
+    res.json(saveStorage(randomUUID(), req.body)),
+  );
+  app.put("/api/storages/:id", (req, res) => {
+    if (!store.get("storages", req.params.id))
+      throw new TaskError("NOT_FOUND", "存储源不存在");
+    res.json(saveStorage(req.params.id, req.body));
+  });
+  app.delete("/api/storages/:id", (req, res) => {
+    engine.idle();
+    const s = store.get<StorageSource>("storages", req.params.id);
+    if (!s) throw new TaskError("NOT_FOUND", "存储源不存在");
+    if (
+      store.all<BackupConfig>("configs").some((c) => c.storage_name === s.name)
+    )
+      throw new TaskError("CONFLICT", "请先解除配置与此存储源的关联");
+    store.delete("storages", s.id);
+    res.json({ ok: true });
+  });
+  app.post("/api/storages/:id/verify", async (req, res) => {
+    engine.idle();
+    const s = store.get<StorageSource>("storages", req.params.id);
+    if (!s) throw new TaskError("NOT_FOUND", "存储源不存在");
+    engine.fileOperation = true;
+    try {
+      await engine.storage.scan({ storage_name: s.name } as BackupConfig);
+      res.json({ ok: true });
+    } finally {
+      engine.fileOperation = false;
+    }
   });
   const deletionChecks = new Map<
     string,
@@ -377,9 +533,11 @@ export function createApp({
     }
     async function roots(cfg: BackupConfig) {
       return await Promise.all([
-        cfg.library_dir
-          ? scan(cfg.library_dir)
-          : Promise.resolve(new Map<string, string[]>()),
+        engine.storage.resolve(cfg)?.kind === "rclone"
+          ? engine.storage.scan(cfg)
+          : engine.storage.localRoot(cfg)
+            ? scan(engine.storage.localRoot(cfg))
+            : Promise.resolve(new Map<string, string[]>()),
         scan(engine.downloadDir(cfg)),
       ]);
     }
@@ -395,7 +553,9 @@ export function createApp({
       const files = await Promise.all(
         paths.map(async (path) => ({
           path,
-          identity: await fileIdentity(path),
+          identity: maps[0].get(body.bv)?.includes(path)
+            ? await engine.storage.identity(c, path)
+            : await fileIdentity(path),
         })),
       );
       if (!body.confirmation) {
@@ -423,9 +583,7 @@ export function createApp({
         );
       try {
         for (const file of files) {
-          if ((await fileIdentity(file.path)) !== file.identity)
-            throw new TaskError("CONFLICT", "文件已变化，请重新确认删除");
-          await unlink(file.path);
+          await engine.storage.delete(c, file.path, file.identity);
           for (const scanned of scans.values()) {
             const map = await scanned;
             const remaining = (map.get(body.bv) || []).filter(
@@ -485,46 +643,51 @@ export function createApp({
       })
       .parse(req.body);
     engine.idle();
-    if (!c.library_dir.trim())
-      throw new TaskError("VALIDATION", "请先在配置中设置存档目录");
-    engine.fileOperation = true;
-    try {
-      const result = await archiveFile(
+    const result = await engine.transfer("archive", c, body.bv, (ctx) =>
+      engine.storage.archive(
+        c,
         engine.downloadDir(c),
-        expandPath(c.library_dir),
         body.bv,
         body.confirmedHash,
-      );
-      if (result.status !== "duplicate")
-        store.transaction(() => {
-          for (const snapshotConfig of store.all<BackupConfig>("configs")) {
-            const snap = store.get<Snapshot>("snapshots", snapshotConfig.id);
-            if (snap && snapshotConfig.id === c.id) {
-              snap.id = randomUUID();
-              for (const item of snap.items)
-                if (item.bv === body.bv) item.base_status = "archived";
-              store.put("snapshots", snapshotConfig.id, snap);
-            }
+        ctx,
+      ),
+    );
+    if (result.status !== "duplicate")
+      store.transaction(() => {
+        for (const snapshotConfig of store.all<BackupConfig>("configs")) {
+          const snap = store.get<Snapshot>("snapshots", snapshotConfig.id);
+          if (snap && snapshotConfig.id === c.id) {
+            snap.id = randomUUID();
+            for (const item of snap.items)
+              if (item.bv === body.bv) item.base_status = "archived";
+            store.put("snapshots", snapshotConfig.id, snap);
           }
-          for (const receiptConfig of store.all<BackupConfig>("configs")) {
-            const key = receiptConfig.id + ":" + body.bv;
-            const receipt = store.get<{ path: string }>("receipts", key);
-            if (receipt?.path === result.source)
-              store.put("receipts", key, {
-                ...receipt,
-                path: result.destination,
-              });
-          }
-          store.db
-            .prepare(
-              "UPDATE OR REPLACE media_files SET path=?,metadata=json_set(metadata,'$.path',?) WHERE path=?",
-            )
-            .run(result.destination, result.destination, result.source);
-        });
-      res.json(result);
-    } finally {
-      engine.fileOperation = false;
-    }
+        }
+        for (const receiptConfig of store.all<BackupConfig>("configs")) {
+          const key = receiptConfig.id + ":" + body.bv;
+          const receipt = store.get<{ path: string }>("receipts", key);
+          if (receipt?.path === result.source)
+            store.put("receipts", key, {
+              ...receipt,
+              path: result.destination,
+            });
+        }
+        store.db
+          .prepare(
+            "UPDATE OR REPLACE media_files SET path=?,metadata=json_set(metadata,'$.path',?) WHERE path=?",
+          )
+          .run(result.destination, result.destination, result.source);
+      });
+    res.json(result);
+  });
+  app.post("/api/configs/:id/retrieve", async (req, res) => {
+    const c = engine.config(req.params.id);
+    const { bv } = z.object({ bv: bvSchema }).parse(req.body);
+    const result = await engine.transfer("retrieve", c, bv, (ctx) =>
+      engine.storage.retrieve(c, engine.downloadDir(c), bv, ctx),
+    );
+    engine.library.recordFile("bilibili", bv, result);
+    res.json(result);
   });
   async function resolveLocalFile(c: BackupConfig, bv: string) {
     const receipt = store.get<{ path: string }>("receipts", c.id + ":" + bv);
@@ -533,10 +696,9 @@ export function createApp({
         "SELECT f.path FROM media_files f JOIN media_sources s ON s.id=f.source_id WHERE s.platform='bilibili' AND s.external_id=?",
       )
       .all(bv) as { path: string }[];
-    const roots = [
-      c.library_dir ? expandPath(c.library_dir) : "",
-      engine.downloadDir(c),
-    ].filter(Boolean);
+    const roots = [engine.storage.localRoot(c), engine.downloadDir(c)].filter(
+      Boolean,
+    );
     const status = store
       .get<Snapshot>("snapshots", c.id)
       ?.items.find((i) => i.bv === bv)?.base_status;
@@ -585,10 +747,21 @@ export function createApp({
     }
     return undefined;
   }
+  async function localOrRetrieve(c: BackupConfig, bv: string) {
+    let path = await resolveLocalFile(c, bv);
+    if (!path && engine.storage.resolve(c)?.kind === "rclone") {
+      const result = await engine.transfer("retrieve", c, bv, (ctx) =>
+        engine.storage.retrieve(c, engine.downloadDir(c), bv, ctx),
+      );
+      engine.library.recordFile("bilibili", bv, result);
+      path = result.path;
+    }
+    return path;
+  }
   app.post("/api/configs/:id/open-file", async (req, res) => {
     const c = engine.config(req.params.id);
     const { bv } = z.object({ bv: bvSchema }).parse(req.body);
-    const path = await resolveLocalFile(c, bv);
+    const path = await localOrRetrieve(c, bv);
     if (!path) throw new TaskError("CONFLICT", "未找到本地视频，请刷新列表");
     await openPath(path);
     res.json({ ok: true, path });
@@ -598,7 +771,7 @@ export function createApp({
     let path = engine.downloadDir(config);
     const body = z.object({ bv: bvSchema.optional() }).parse(req.body || {});
     if (body.bv) {
-      const file = await resolveLocalFile(config, body.bv);
+      const file = await localOrRetrieve(config, body.bv);
       if (!file) throw new TaskError("CONFLICT", "未找到本地视频，请刷新列表");
       path = dirname(file);
     }
@@ -639,7 +812,11 @@ export function createApp({
                 ? 422
                 : 409,
           )
-          .json({ detail: error.message });
+          .json({
+            detail: error.message,
+            code: error.code,
+            error_details: error.details,
+          });
         return;
       }
       res.status(500).json({ detail: "操作失败，请检查文件权限和请求格式" });

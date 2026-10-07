@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 state/
+/config.toml
 .qa/
 node_modules/
 bin/

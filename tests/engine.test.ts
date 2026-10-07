@@ -85,7 +85,6 @@ async function fixture() {
     excluded: [],
     next_run: null,
   };
-  store.put("configs", cfg.id, cfg);
   store.put<CookieSource>("cookies", "cookie", {
     id: "cookie",
     name: "fixture",
@@ -95,6 +94,7 @@ async function fixture() {
     profile: "",
     status: "未验证",
   });
+  store.put("configs", cfg.id, cfg);
   store.put<Settings>("settings", "global", {
     download_root: join(root, "downloads"),
     ffmpeg: process.execPath,
@@ -156,6 +156,28 @@ test("Cookie failure stops the entire job without downloading later entries", as
       f.store.get<CookieSource>("cookies", "cookie")!.status,
       "验证失败",
     );
+  } finally {
+    await f.close();
+  }
+});
+
+test("refresh failures persist diagnostic details and retain the old snapshot", async () => {
+  const f = await fixture();
+  try {
+    f.engine.storage.scan = async () => {
+      throw new TaskError(
+        "STORAGE_FAILED",
+        "读取云端列表失败",
+        "HTTP 401 invalid_grant",
+      );
+    };
+    const job = f.engine.enqueue("refresh", "cfg");
+    await f.engine.pump();
+    const failed = f.store.get<Job>("jobs", job.id)!;
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.error_code, "STORAGE_FAILED");
+    assert.equal(failed.error_details, "HTTP 401 invalid_grant");
+    assert.equal(f.store.get<Snapshot>("snapshots", "cfg")!.id, "v1");
   } finally {
     await f.close();
   }

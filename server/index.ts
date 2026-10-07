@@ -51,6 +51,7 @@ process.once("exit", release);
 const { app, engine, store } = createApp({
   root,
   stateDir,
+  configPath: process.env.BACKUP_CONFIG_FILE,
   legacy: resolve(root, "legacy/config.toml"),
   token,
 });

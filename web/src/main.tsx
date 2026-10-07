@@ -60,6 +60,7 @@ import {
   time,
 } from "./ui";
 import { ConfigEditor, CookieEditor, ExclusionsEditor } from "./editors";
+import { Storages } from "./storages";
 import "./style.css";
 
 const statuses: Record<ItemStatus, string> = {
@@ -84,6 +85,7 @@ const navItems = [
   { id: "configs", title: "备份配置", icon: Layers3 },
   { id: "jobs", title: "任务记录", icon: Activity },
   { id: "cookies", title: "Cookie 管理", icon: KeyRound },
+  { id: "storages", title: "存储管理", icon: Archive },
   { id: "settings", title: "全局设置", icon: Settings2 },
 ];
 const getRoute = () => {
@@ -268,6 +270,8 @@ function App() {
             <Jobs data={data} perform={perform} />
           ) : route.page === "settings" ? (
             <Settings data={data} action={action} />
+          ) : route.page === "storages" ? (
+            <Storages data={data} action={action} />
           ) : (
             <Configurations
               data={data}
@@ -288,6 +292,7 @@ function App() {
         <ConfigEditor
           config={data.configs.find((c) => c.id === modal.id)}
           cookies={data.cookies}
+          storages={data.storages}
           saved={saved}
           close={() => setModal(null)}
           remove={(id) => setModal({ kind: "delete-config", id })}
@@ -553,6 +558,9 @@ function DiffWorkspace({
   action: Action;
   notify: (s: string) => void;
 }) {
+  const cloudStorage = data.storages.some(
+    (s) => s.name === c.storage_name && s.kind === "rclone",
+  );
   const [batchProgress, setBatchProgress] = useState("");
   const [batchReport, setBatchReport] = useState("");
   const [fileMenu, setFileMenu] = useState<DiffItem | null>(null);
@@ -685,7 +693,7 @@ function DiffWorkspace({
       );
       if (
         !window.confirm(
-          `确认永久删除「${item.title}」的以下本地视频文件？此操作无法撤销。\n\n${preview.files.join("\n")}\n\n删除后才可排除该条目。`,
+          `确认删除「${item.title}」的以下视频文件？包含云端存档和本地副本。\n\n${preview.files.join("\n")}\n\n删除后才可排除该条目。`,
         )
       )
         return;
@@ -693,7 +701,7 @@ function DiffWorkspace({
         path,
         "POST",
         { bv: item.bv, confirmation: preview.confirmation },
-        "本地文件已删除，现在可以排除该条目",
+        "视频文件已删除，现在可以排除该条目",
       );
       setFileMenu(null);
     } catch (e) {
@@ -811,7 +819,7 @@ function DiffWorkspace({
         if (
           previews.length &&
           window.confirm(
-            `确认永久删除所选 ${previews.length} 项的以下本地文件？包含列出的下载及存档副本，无法撤销。\n\n${previews.map((p) => `${p.item.title}\n${p.files.join("\n")}`).join("\n\n")}${failures.length ? `\n\n另有 ${failures.length} 项检查失败，不会删除。` : ""}`,
+            `确认删除所选 ${previews.length} 项的以下文件？包含列出的本地及云端存档副本。\n\n${previews.map((p) => `${p.item.title}\n${p.files.join("\n")}`).join("\n\n")}${failures.length ? `\n\n另有 ${failures.length} 项检查失败，不会删除。` : ""}`,
           )
         ) {
           for (const [index, preview] of previews.entries()) {
@@ -891,7 +899,7 @@ function DiffWorkspace({
             ref={menuRef}
             id="file-action-menu"
             role="menu"
-            aria-label="本地文件操作"
+            aria-label="视频文件操作"
             className="file-action-menu"
             style={menuPosition}
           >
@@ -921,7 +929,25 @@ function DiffWorkspace({
                 }}
               >
                 <Archive size={18} />
-                转移到存档目录
+                转移到存储源
+              </Button>
+            )}
+            {cloudStorage && fileMenu.base_status === "archived" && (
+              <Button
+                role="menuitem"
+                disabled={pending || !!running}
+                onClick={() => {
+                  const bv = fileMenu.bv;
+                  setFileMenu(null);
+                  void run(
+                    `configs/${c.id}/retrieve`,
+                    { bv },
+                    "已取回本地，云端副本保留",
+                  );
+                }}
+              >
+                <Download size={18} />
+                取回到本地
               </Button>
             )}
             <Button
@@ -934,7 +960,7 @@ function DiffWorkspace({
               {pending
                 ? "正在检查文件…"
                 : fileMenu.base_status === "archived"
-                  ? "删除本地文件（含存档）"
+                  ? "删除文件（含存档）"
                   : "删除下载文件"}
             </Button>
           </div>,
@@ -1226,7 +1252,11 @@ function DiffWorkspace({
                               <Button
                                 variant="quiet icon-button"
                                 disabled={pending}
-                                title="打开文件"
+                                title={
+                                  cloudStorage && i.base_status === "archived"
+                                    ? "取回并打开文件"
+                                    : "打开文件"
+                                }
                                 aria-label={"打开文件 " + i.title}
                                 onClick={() =>
                                   run(
@@ -1374,9 +1404,16 @@ function DiffWorkspace({
             下载所选 ({batch.download.length})
           </Button>
           <Button
-            title={c.library_dir ? "转移勾选的已下载条目" : "请先设置存档目录"}
+            title={
+              c.storage_name || c.library_dir
+                ? "转移勾选的已下载条目"
+                : "请先选择存储源"
+            }
             disabled={
-              !!running || pending || !c.library_dir || !batch.archive.length
+              !!running ||
+              pending ||
+              !(c.storage_name || c.library_dir) ||
+              !batch.archive.length
             }
             onClick={() => bulk("archive")}
           >
@@ -1577,6 +1614,8 @@ function Jobs({
                     refresh: "刷新列表",
                     download: "下载备份",
                     cookie: "验证 Cookie",
+                    archive: "存档文件",
+                    retrieve: "取回文件",
                   }[j.kind]
                 }
                 {j.config_id
@@ -1650,9 +1689,28 @@ function Jobs({
                   {j.failures.map((f, i) => (
                     <li key={i}>
                       <code>{f.bv}</code> {f.message}
+                      {f.details && (
+                        <pre>
+                          {f.code && `${f.code}\n`}
+                          {f.details}
+                        </pre>
+                      )}
                     </li>
                   ))}
                 </ul>
+              </details>
+            )}
+            {(j.status === "failed" || j.error_code || j.error_details) && (
+              <details className="job-error" open={j.status === "failed"}>
+                <summary>
+                  错误详情{j.error_code && ` · ${j.error_code}`}
+                </summary>
+                <pre>
+                  {j.error_details ||
+                    (j.error_code
+                      ? j.message
+                      : "这条历史任务只保存了错误摘要；重新执行后可记录详细原因。")}
+                </pre>
               </details>
             )}
           </article>
@@ -1699,19 +1757,19 @@ function Settings({ data, action }: { data: AppState; action: Action }) {
           <Folder size={21} />
           <div>
             <h2>下载与存储</h2>
-            <p>默认按配置名创建文件夹，存档目录仍在每份配置中独立设置。</p>
+            <p>本地下载用于合并和校验，存档位置通过存储源名字选择。</p>
           </div>
         </div>
         <div className="form-grid">
           <Field
-            label="统一下载根目录"
-            hint="未设置独立下载目录时，使用「根目录 / 配置名」。修改路径不会移动已有文件。"
+            label="统一中转根目录（可选）"
+            hint="留空默认 ~/Downloads/ArchiveFlow，每份配置使用独立子目录。修改路径不会移动已有文件。"
             wide
           >
             <input
               name="download_root"
               defaultValue={data.settings.download_root}
-              required
+              placeholder="默认：~/Downloads/ArchiveFlow"
             />
           </Field>
           <Field label="ffmpeg 命令或绝对路径">
@@ -1724,8 +1782,26 @@ function Settings({ data, action }: { data: AppState; action: Action }) {
               required
             />
           </Field>
+          <Field
+            label="云存储账号配置文件（可选）"
+            hint="留空使用项目配置文件旁的 rclone.conf。文件内容不会回显。"
+            wide
+          >
+            <input
+              name="rclone_config"
+              defaultValue={data.settings.rclone_config || ""}
+              placeholder="使用服务独立的账号配置"
+            />
+          </Field>
         </div>
         <div className="runtime-grid">
+          <span>
+            rclone{" "}
+            <b>
+              {data.runtime.rclone_version} ·{" "}
+              {data.runtime.rclone_available ? "项目自带" : "尚未安装"}
+            </b>
+          </span>
           <span>
             yt-dlp <b>{data.runtime.yt_dlp}</b>
             <Badge tone={data.runtime.downloader_available ? "green" : "amber"}>
@@ -1750,6 +1826,11 @@ function Settings({ data, action }: { data: AppState; action: Action }) {
           </Button>
         </div>
       </form>
+      <Note>
+        项目配置保存在 {data.runtime.config_file}，界面修改会自动写回。
+        迁移时复制这份文件和独立的 rclone.conf；手动编辑前请停止服务。
+        配置包含导入的 Cookie，请妥善保管。
+      </Note>
       <Note>
         自动计划由 Node.js
         服务执行，电脑需保持唤醒、服务需持续运行。关闭浏览器不影响任务；服务重启后，未完成的任务会标为「已中断」。

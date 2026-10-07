@@ -8,6 +8,7 @@ import {
   rm,
   access,
   stat,
+  symlink,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,6 +72,53 @@ test("archive moves without overwrite, compares nested names, and rechecks delet
   }
 });
 
+test("organized local archives preserve duplicates and reject directory links and traversal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "archive-layout-"));
+  const download = join(root, "download"),
+    library = join(root, "library"),
+    outside = join(root, "outside");
+  await mkdir(download);
+  await mkdir(library);
+  await mkdir(outside);
+  const bv = "BV1abcDEFghi",
+    name = `[2026-08-01] ${bv}.mp4`,
+    source = join(download, name);
+  try {
+    await writeFile(source, "video");
+    const result = await archiveFile(
+      download,
+      library,
+      bv,
+      undefined,
+      "2026/08",
+    );
+    assert.equal(result.destination, join(library, "2026", "08", name));
+    assert.equal(await readFile(result.destination, "utf8"), "video");
+    await writeFile(source, "video");
+    const duplicate = await archiveFile(download, library, bv);
+    assert.equal(duplicate.status, "duplicate");
+    assert.equal(duplicate.destination, result.destination);
+    await assert.rejects(
+      archiveFile(download, library, bv, undefined, "../../outside"),
+      /格式无效/,
+    );
+    await rm(result.destination);
+    await symlink(
+      outside,
+      join(library, "2025"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    await assert.rejects(
+      archiveFile(download, library, bv, undefined, "2025/08"),
+      /目录链接/,
+    );
+    await access(source);
+    await assert.rejects(access(join(outside, "08")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("archive API updates snapshot and receipt and rejects missing local files", async () => {
   const { createApp } = await import("../server/app.ts");
   const root = await mkdtemp(join(tmpdir(), "archive-route-"));
@@ -94,6 +142,7 @@ test("archive API updates snapshot and receipt and rejects missing local files",
   const config = {
     id: "test",
     name: "test",
+    season_url: "https://space.bilibili.com/1/lists/2",
     library_dir: library,
     download_dir: download,
     excluded: [],

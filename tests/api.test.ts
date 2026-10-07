@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  rm,
+  readFile,
+  mkdir,
+  writeFile,
+  access,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { once } from "node:events";
@@ -8,12 +15,19 @@ import { request as httpRequest } from "node:http";
 import { createApp } from "../server/app.ts";
 import type { BackupConfig, Snapshot, Job } from "../shared/contracts.ts";
 
-async function fixture(token = "") {
+async function fixture(token = "", opened?: string[]) {
   const dir = await mkdtemp(join(tmpdir(), "archive-api-"));
   const { app, store, engine } = createApp({
     root: resolve("."),
     stateDir: dir,
     token,
+    ...(opened
+      ? {
+          openPath: async (path: string) => {
+            opened.push(path);
+          },
+        }
+      : {}),
   });
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -61,6 +75,289 @@ const body = {
   auto_download: false,
   after_date: "",
 };
+test("rclone import identifies multiple remotes, replaces the daemon config atomically and never returns secrets", async () => {
+  const f = await fixture();
+  const managed = join(f.dir, "rclone.conf"),
+    external = join(f.dir, "external.conf");
+  const oldDir = join(f.dir, "old"),
+    newDir = join(f.dir, "new");
+  await mkdir(oldDir);
+  await mkdir(newDir);
+  await writeFile(join(oldDir, "BV1abcDEFghi.mp4"), "old-video");
+  await writeFile(join(newDir, "BV1xyzABCdef.mp4"), "new-video");
+  const old = `[qa]\ntype = alias\nremote = ${oldDir.replace(/\\/g, "/")}\n`;
+  await writeFile(managed, old);
+  await writeFile(external, old);
+  f.store.put("settings", "global", {
+    ...f.engine.settings(),
+    rclone_config: external,
+  });
+  try {
+    const cloud = (
+      await f.request("storages", "POST", {
+        name: "云盘",
+        kind: "rclone",
+        root: "qa:",
+      })
+    ).data;
+    const local = (
+      await f.request("storages", "POST", {
+        name: "本地",
+        kind: "local",
+        root: oldDir,
+      })
+    ).data;
+    const c = (
+      await f.request("configs", "POST", { ...body, storage_name: cloud.name })
+    ).data;
+    const l = (
+      await f.request("configs", "POST", {
+        ...body,
+        name: "本机课程",
+        storage_name: local.name,
+      })
+    ).data;
+    f.store.put("snapshots", c.id, { id: "cloud-before" });
+    f.store.put("snapshots", l.id, { id: "local-before" });
+    assert.deepEqual((await f.request("storage-config")).data, {
+      remotes: ["qa"],
+    });
+    assert.deepEqual(
+      [...(await f.engine.storage.scan(c)).keys()],
+      ["BV1abcDEFghi"],
+    );
+    for (const content of [
+      "broken-secret-content",
+      "[incomplete]\ntoken = fake-secret\n",
+      "RCLONE_ENCRYPT_V0:\ninvalid-ciphertext",
+    ]) {
+      const invalid = await f.request("storage-config", "POST", { content });
+      assert.equal(invalid.status, 422);
+      assert.ok(!JSON.stringify(invalid.data).includes("fake-secret"));
+      assert.equal(await readFile(managed, "utf8"), old);
+      assert.equal(f.engine.settings().rclone_config, external);
+      assert.equal(f.engine.fileOperation, false);
+    }
+    const content = `\uFEFF[qa]\ntype = alias\nremote = ${newDir.replace(/\\/g, "/")}\ntoken = fake-secret\n\n[backup]\ntype = alias\nremote = qa:\n`;
+    const imported = await f.request("storage-config", "POST", { content });
+    assert.equal(imported.status, 200);
+    assert.deepEqual(imported.data, { remotes: ["backup", "qa"] });
+    assert.equal(await readFile(managed, "utf8"), content.slice(1));
+    assert.equal(await readFile(external, "utf8"), old);
+    assert.equal(f.engine.settings().rclone_config, "");
+    assert.equal(f.store.get("snapshots", c.id), undefined);
+    assert.equal(f.store.get<Snapshot>("snapshots", l.id)?.id, "local-before");
+    assert.deepEqual(
+      [...(await f.engine.storage.scan(c)).keys()],
+      ["BV1xyzABCdef"],
+    );
+    assert.deepEqual((await f.request("storage-config")).data, imported.data);
+    assert.ok(
+      !JSON.stringify((await f.request("state")).data).includes("fake-secret"),
+    );
+    f.engine.fileOperation = true;
+    assert.equal(
+      (await f.request("storage-config", "POST", { content: old })).status,
+      409,
+    );
+    f.engine.fileOperation = false;
+    assert.equal(await readFile(managed, "utf8"), content.slice(1));
+  } finally {
+    f.engine.fileOperation = false;
+    await f.close();
+  }
+});
+test("named storage CRUD preserves bindings on rename, invalidates changed roots and blocks removal in use", async () => {
+  const f = await fixture();
+  try {
+    const config = (await f.request("configs", "POST", body)).data;
+    const source = (
+      await f.request("storages", "POST", {
+        name: "视频库",
+        kind: "local",
+        root: f.dir,
+      })
+    ).data;
+    assert.equal(
+      f.store.get<BackupConfig>("configs", config.id)?.storage_name,
+      undefined,
+      "creating a source must not bind unrelated configs",
+    );
+    assert.equal(
+      (
+        await f.request("storages", "POST", {
+          name: "视频库",
+          kind: "local",
+          root: f.dir,
+        })
+      ).status,
+      409,
+    );
+    assert.equal(
+      (
+        await f.request("storages", "POST", {
+          name: "云端",
+          kind: "rclone",
+          root: "D:\\invalid",
+        })
+      ).status,
+      422,
+    );
+    assert.equal(
+      (
+        await f.request(`configs/${config.id}`, "PUT", {
+          ...body,
+          storage_name: "不存在",
+        })
+      ).status,
+      422,
+    );
+    assert.equal(
+      (
+        await f.request(`configs/${config.id}`, "PUT", {
+          ...body,
+          storage_name: source.name,
+        })
+      ).status,
+      200,
+    );
+    f.store.put("snapshots", config.id, {
+      id: "preserved",
+      items: [],
+      refreshed_at: 1,
+    });
+    assert.equal(
+      (await f.request(`storages/${source.id}/verify`, "POST")).status,
+      200,
+    );
+    assert.equal(
+      (await f.request(`storages/${source.id}`, "DELETE")).status,
+      409,
+    );
+    await f.request(`storages/${source.id}`, "PUT", {
+      ...source,
+      name: "本机视频",
+    });
+    assert.equal(
+      f.store.get<BackupConfig>("configs", config.id)?.storage_name,
+      "本机视频",
+    );
+    assert.equal(
+      f.store.get<Snapshot>("snapshots", config.id)?.id,
+      "preserved",
+    );
+    await f.request(`storages/${source.id}`, "PUT", {
+      ...source,
+      name: "本机视频",
+      root: join(f.dir, "other"),
+    });
+    assert.equal(f.store.get("snapshots", config.id), undefined);
+    await f.request(`configs/${config.id}`, "PUT", body);
+    assert.equal(
+      (await f.request(`storages/${source.id}`, "DELETE")).status,
+      200,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("cloud archive and open use bundled SDK without Cookie, preserve confirmations, and protect exclusions", async () => {
+  const opened: string[] = [];
+  const f = await fixture("", opened);
+  const bv = "BV1abcDEFghi",
+    download = join(f.dir, "download"),
+    library = join(f.dir, "remote");
+  await mkdir(download);
+  await mkdir(library);
+  await writeFile(
+    join(f.dir, "rclone.conf"),
+    `[qa]\ntype = alias\nremote = ${library.replace(/\\/g, "/")}\n`,
+  );
+  const source = (
+    await f.request("storages", "POST", {
+      name: "云存档",
+      kind: "rclone",
+      root: "qa:",
+    })
+  ).data;
+  const c = (
+    await f.request("configs", "POST", {
+      ...body,
+      download_dir: download,
+      storage_name: source.name,
+    })
+  ).data;
+  f.store.put("snapshots", c.id, {
+    id: "cloud",
+    refreshed_at: 1,
+    items: [{ bv, title: "video", base_status: "staged", date: null, url: "" }],
+  });
+  await writeFile(join(download, `${bv}.mp4`), "video");
+  f.engine.start();
+  try {
+    assert.equal(
+      (await f.request(`storages/${source.id}/verify`, "POST")).status,
+      200,
+    );
+    const archived = await f.request(`configs/${c.id}/archive`, "POST", { bv });
+    assert.equal(archived.status, 200);
+    assert.equal(archived.data.status, "archived");
+    assert.equal(
+      f.engine.diff(f.engine.config(c.id))[0].base_status,
+      "archived",
+    );
+    await assert.rejects(access(join(download, `${bv}.mp4`)));
+    assert.equal(
+      (await f.request(`configs/${c.id}/open-file`, "POST", { bv })).status,
+      200,
+    );
+    assert.deepEqual(opened, [join(download, `${bv}.mp4`)]);
+    assert.equal(
+      (await f.request(`configs/${c.id}/excluded`, "PUT", { excluded: [bv] }))
+        .status,
+      409,
+    );
+    const retrieved = await f.request(`configs/${c.id}/retrieve`, "POST", {
+      bv,
+    });
+    assert.equal(retrieved.status, 200);
+    assert.equal(await readFile(retrieved.data.path, "utf8"), "video");
+    const preview = await f.request(`configs/${c.id}/delete-file`, "POST", {
+      bv,
+    });
+    assert.equal(preview.data.files.length, 2);
+    assert(preview.data.files.includes(`qa:${bv}.mp4`));
+    assert.equal(
+      (
+        await f.request(`configs/${c.id}/delete-file`, "POST", {
+          bv,
+          confirmation: preview.data.confirmation,
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      f.engine.diff(f.engine.config(c.id))[0].base_status,
+      "missing",
+    );
+    assert.equal(
+      (await f.request(`configs/${c.id}/excluded`, "PUT", { excluded: [bv] }))
+        .status,
+      200,
+    );
+    assert.deepEqual(
+      f.store.all<Job>("jobs").map((j) => [j.kind, j.status]),
+      [
+        ["archive", "completed"],
+        ["retrieve", "completed"],
+        ["retrieve", "completed"],
+      ],
+    );
+  } finally {
+    await f.close();
+  }
+});
 test("config CRUD, unified download directory, cache-only diff, exclusions and stale snapshot protection", async () => {
   const f = await fixture();
   try {
@@ -178,11 +475,13 @@ test("Cookie upload is scoped, never echoed, refreshes in place, and cannot dele
       (await f.request(`cookies/${c.data.id}`, "DELETE")).status,
       409,
     );
-    await f.request(`cookies/${c.data.id}`, "PUT", {
+    const updated = await f.request(`cookies/${c.data.id}`, "PUT", {
       ...input,
       content: content.replace("test_fixture", "fresh_fixture"),
     });
-    assert((await readFile(c.data.path, "utf8")).includes("fresh_fixture"));
+    assert(
+      (await readFile(updated.data.path, "utf8")).includes("fresh_fixture"),
+    );
     const invalid = await f.request("cookies", "POST", {
       ...input,
       content: "SECRET_INVALID_INPUT",
@@ -193,6 +492,45 @@ test("Cookie upload is scoped, never echoed, refreshes in place, and cannot dele
       !JSON.stringify((await f.request("state")).data).includes(
         "fresh_fixture",
       ),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("directory layout persists through the API without dropping snapshots and rejects arbitrary paths", async () => {
+  const f = await fixture();
+  try {
+    const created = await f.request("configs", "POST", body);
+    const c = created.data;
+    f.store.put("snapshots", c.id, {
+      id: "cached",
+      refreshed_at: 1,
+      items: [],
+    });
+    const saved = await f.request(`configs/${c.id}`, "PUT", {
+      ...body,
+      directory_template: "{{YYYY}}/{{MM}}/",
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(
+      f.store.get<BackupConfig>("configs", c.id)!.directory_template,
+      "{{YYYY}}/{{MM}}/",
+    );
+    assert.equal(f.store.get<Snapshot>("snapshots", c.id)!.id, "cached");
+    assert(
+      (await readFile(join(f.dir, "config.toml"), "utf8")).includes(
+        "{{YYYY}}/{{MM}}/",
+      ),
+    );
+    assert.equal(
+      (
+        await f.request(`configs/${c.id}`, "PUT", {
+          ...body,
+          directory_template: "../../escape",
+        })
+      ).status,
+      422,
     );
   } finally {
     await f.close();
@@ -319,4 +657,3 @@ test("date sorting precedes pagination and always leaves unknown dates last", as
     await f.close();
   }
 });
-

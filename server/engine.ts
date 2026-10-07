@@ -1,9 +1,9 @@
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { parse } from "smol-toml";
+import { DEFAULT_DOWNLOAD_ROOT } from "../shared/contracts.ts";
 import type {
   BackupConfig,
   CookieSource,
@@ -25,6 +25,7 @@ import {
 } from "./paths.ts";
 import { Downloader, validateCookie } from "./downloader.ts";
 import { TaskError } from "./process.ts";
+import { StorageManager } from "./storage.ts";
 
 export const now = () => Date.now() / 1000;
 export const isActive = (j: Job) =>
@@ -38,11 +39,18 @@ export class Engine {
   pumpPromise?: Promise<void>;
   cookieDir: string;
   library: Library;
+  storage: StorageManager;
+  transferPromise?: Promise<unknown>;
   constructor(
     public store: Store,
     public downloader: Downloader,
     legacy?: string,
   ) {
+    this.storage = new StorageManager(
+      store,
+      () => this.settings(),
+      downloader.root,
+    );
     this.library = new Library(store);
     for (const row of store.db
       .prepare("SELECT id,body FROM documents WHERE kind='snapshots'")
@@ -55,13 +63,17 @@ export class Engine {
     this.cookieDir = join(store.root, "cookies");
     mkdirSync(this.cookieDir, { recursive: true, mode: 0o700 });
     if (!store.get("settings", "global")) {
-      store.put<Settings>("settings", "global", {
-        download_root: join(homedir(), "Downloads", "ArchiveFlow"),
-        ffprobe: "ffprobe",
-        ffmpeg: "ffmpeg",
+      const firstRun = !store.configuration.exists;
+      store.transaction(() => {
+        store.put<Settings>("settings", "global", {
+          download_root: DEFAULT_DOWNLOAD_ROOT,
+          ffprobe: "ffprobe",
+          ffmpeg: "ffmpeg",
+        });
+        if (firstRun && legacy && existsSync(legacy)) this.importLegacy(legacy);
       });
-      if (legacy && existsSync(legacy)) this.importLegacy(legacy);
     }
+    this.storage.migrate();
     for (const job of store.all<Job>("jobs"))
       if (isActive(job))
         this.updateJob(job.id, {
@@ -170,6 +182,79 @@ export class Engine {
     }));
   }
   fileOperation = false;
+  transfer<T>(
+    kind: "archive" | "retrieve",
+    c: BackupConfig,
+    bv: string,
+    fn: (ctx: {
+      signal: AbortSignal;
+      message: (value: string) => void;
+      progress: (value: number) => void;
+    }) => Promise<T>,
+  ): Promise<T> {
+    this.idle();
+    if (this.stopped) throw new TaskError("STOPPING", "服务正在关闭");
+    // File transfers use the same global lock and durable task record as downloads.
+    const job: Job = {
+      id: randomUUID(),
+      kind,
+      config_id: c.id,
+      current_bv: bv,
+      total: 1,
+      done: 0,
+      failures: [],
+      status: "running",
+      message: "准备中",
+      created_at: now(),
+      updated_at: now(),
+    };
+    this.store.put("jobs", job.id, job);
+    this.fileOperation = true;
+    this.currentJob = job.id;
+    this.controller = new AbortController();
+    this.updateJob(job.id, {
+      status: "running",
+      message: kind === "archive" ? "准备存档" : "准备取回",
+    });
+    const promise = fn({
+      signal: this.controller.signal,
+      message: (message) => this.updateJob(job.id, { message, progress: 0 }),
+      progress: (progress) => this.updateJob(job.id, { progress }),
+    })
+      .then((result) => {
+        this.updateJob(job.id, {
+          status: "completed",
+          message: "已完成",
+          done: 1,
+          progress: 100,
+        });
+        return result;
+      })
+      .catch((error) => {
+        this.updateJob(job.id, {
+          status: this.stopped
+            ? "interrupted"
+            : error instanceof TaskError && error.code === "CANCELLED"
+              ? "cancelled"
+              : "failed",
+          message:
+            error instanceof TaskError
+              ? error.message
+              : "存储操作失败，本地文件已保留",
+          error_code:
+            error instanceof TaskError ? error.code : "STORAGE_FAILED",
+          error_details: error instanceof TaskError ? error.details : undefined,
+        });
+        throw error;
+      })
+      .finally(() => {
+        this.fileOperation = false;
+        this.currentJob = undefined;
+        this.controller = undefined;
+      });
+    this.transferPromise = promise;
+    return promise;
+  }
   busy(id?: string) {
     if (this.fileOperation) return true;
     return this.store
@@ -243,10 +328,13 @@ export class Engine {
     clearInterval(this.timer);
     this.controller?.abort();
     await this.pumpPromise;
+    await this.transferPromise?.catch(() => {});
+    await this.storage.rpc.close();
     await this.library.close();
   }
   pump() {
-    if (this.processing || this.stopped) return this.pumpPromise;
+    if (this.processing || this.stopped || this.fileOperation)
+      return this.pumpPromise;
     this.processing = true;
     this.pumpPromise = this.work().finally(() => {
       this.processing = false;
@@ -330,6 +418,8 @@ export class Engine {
                 : "cancelled"
               : "failed",
           message: error.message,
+          error_code: error.code,
+          error_details: error.details,
         });
       } finally {
         this.currentJob = undefined;
@@ -343,12 +433,10 @@ export class Engine {
     cookie: string,
     signal: AbortSignal,
   ) {
-    this.updateJob(key, { message: "读取合集清单与本地索引" });
+    this.updateJob(key, { message: "读取合集清单与存储索引" });
     const [payload, library, staged] = await Promise.all([
       this.downloader.playlist(cookie, cfg.season_url, signal),
-      cfg.library_dir
-        ? scanMedia(expandPath(cfg.library_dir), true)
-        : Promise.resolve(new Map<string, string[]>()),
+      this.storage.scan(cfg, { signal }),
       scanMedia(this.downloadDir(cfg)),
     ]);
     if (!Array.isArray(payload.entries) || !payload.entries.length)
@@ -435,9 +523,7 @@ export class Engine {
       });
       try {
         // Recheck disk after the user may have moved files since preview.
-        const library = cfg.library_dir
-          ? await scanMedia(expandPath(cfg.library_dir), true)
-          : new Map<string, string[]>();
+        const library = await this.storage.scan(cfg, { signal });
         if (library.has(item.bv)) {
           this.mark(snapshot, item.bv, "archived");
           continue;
@@ -492,6 +578,7 @@ export class Engine {
           ...receipt,
           bv: item.bv,
           format: plan.format,
+          date: plan.date,
           verified_at: now(),
         });
         this.library.recordFile("bilibili", item.bv, receipt);
@@ -509,7 +596,12 @@ export class Engine {
             failed.verified = false;
           }
         }
-        failures.push({ bv: item.bv, message: error.message });
+        failures.push({
+          bv: item.bv,
+          message: error.message,
+          code: error.code,
+          details: error.details,
+        });
       } finally {
         this.store.put("snapshots", cfg.id, snapshot);
         this.updateJob(job.id, { done: index + 1, failures, progress: 0 });
